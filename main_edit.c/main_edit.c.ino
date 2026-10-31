@@ -1223,12 +1223,16 @@ void printCalibrationHelp() {
 
 void printCalibrationStatus() {
   for (byte i = 0; i < NUM_TRAYS; ++i) {
+    long delta = trays[i].rawFiltered - config.tareOffset[i];
     Serial.print(F("T#")); Serial.print(i + 1);
+    Serial.print(F(" W:")); printDeci(Serial, trays[i].weightDg); Serial.print(F("g"));
     Serial.print(F(" Raw:")); Serial.print(trays[i].rawFiltered);
-    Serial.print(F(" Tare:")); Serial.print(config.tareOffset[i]);
+    Serial.print(F("(d:"));
+    if (delta >= 0) Serial.print('+');
+    Serial.print(delta);
+    Serial.print(F(") Tare:")); Serial.print(config.tareOffset[i]);
     Serial.print(F(" Sc:")); printDeci(Serial, config.scaleX10[i]);
-    Serial.print(F(" W:")); printDeci(Serial, trays[i].weightDg);
-    Serial.print(F("g P:")); Serial.print(trays[i].present);
+    Serial.print(F(" P:")); Serial.print(trays[i].present);
     Serial.print(F(" TH:")); printDeci(Serial, config.detectDg[i]);
     Serial.print('/'); printDeci(Serial, config.releaseDg[i]);
     Serial.print(F(" DZ:")); printDeci(Serial, config.deadzoneDg[i]);
@@ -1239,11 +1243,16 @@ void printCalibrationStatus() {
 void printLiveMonitorLine() {
   Serial.print(F("[MON] D:")); Serial.print(door.active ? F("OPN") : F("CLS"));
   for (byte i = 0; i < NUM_TRAYS; ++i) {
-    Serial.print(F(" T")); Serial.print(i + 1); Serial.print(':');
+    long delta = trays[i].rawFiltered - config.tareOffset[i];
+    Serial.print(F(" | T")); Serial.print(i + 1); Serial.print(':');
     printDeci(Serial, trays[i].weightDg);
-    Serial.print(F("g(")); Serial.print(trays[i].present); Serial.print(')');
+    Serial.print(F("g Raw:")); Serial.print(trays[i].rawFiltered);
+    Serial.print('(');
+    if (delta >= 0) Serial.print('+');
+    Serial.print(delta);
+    Serial.print(F(") P:")); Serial.print(trays[i].present);
   }
-  Serial.print(F(" U:")); Serial.print(umbrella.active);
+  Serial.print(F(" | U:")); Serial.print(umbrella.active);
   Serial.print(F(" F:")); Serial.print(fan.active);
   Serial.println();
 }
@@ -1309,9 +1318,10 @@ void handleSerialCommand(char* line) {
     }
     stateDirty = true;
   }
-  else if (strcmp_P(cmd, PSTR("CAL")) == 0) {
+  else if (strcmp_P(cmd, PSTR("CAL")) == 0 || strcmp_P(cmd, PSTR("CALSHOW")) == 0) {
     char* a1 = strtok(NULL, " \t");
-    if (!a1 || strcmp_P(a1, PSTR("SHOW")) == 0 || strcmp_P(a1, PSTR("show")) == 0) {
+    if (a1) toUpperStr(a1);
+    if (!a1 || strcmp_P(a1, PSTR("SHOW")) == 0 || strcmp_P(cmd, PSTR("CALSHOW")) == 0) {
       printCalibrationStatus();
       return;
     }
