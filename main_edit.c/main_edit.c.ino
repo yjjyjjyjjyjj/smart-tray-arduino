@@ -206,7 +206,12 @@ struct WeatherDisplayState {
 
 WeatherDisplayState weatherLcd;
 
-// 수신 버퍼 (SRAM 최적화)
+// 수신 버퍼 및 통신 모드 (기본: MODE_BT 블루투스 모드, 시리얼 입력 시 MODE_SERIAL 독점 모드 전환)
+enum CommMode : uint8_t { MODE_BT = 0, MODE_SERIAL = 1 };
+CommMode commMode = MODE_BT;
+bool btPeerActive = false;                  // 블루투스로부터 데이터가 1회 이상 수신되었는지 여부
+const unsigned long SERIAL_MODE_TIMEOUT_MS = 180000UL; // 시리얼 무입력 180초 경과 시 자동 BT 모드 복귀
+
 char btRxBuf[168];
 byte btRxLen = 0;
 bool btRxOverflow = false;
@@ -216,6 +221,7 @@ char serialRxBuf[80];
 byte serialRxLen = 0;
 unsigned long lastSerialRxMs = 0;
 
+void setCommMode(CommMode nextMode);
 void sendAckP(const char* reqId, PGM_P statusP, PGM_P reasonP = NULL);
 void sendStateSnapshot(Stream &out);
 void refreshLcdWeather(bool force = false);
@@ -526,11 +532,12 @@ bool readHX711Raw(byte ch, long &outRaw) {
     uint8_t oldSREG = SREG;
     cli();
     digitalWrite(HX_CLOCK[ch], HIGH);
-    delayMicroseconds(4);
-    if (i < 24) bits = (bits << 1) | digitalRead(HX_DT[ch]);
+    delayMicroseconds(1);
+    byte b = (i < 24) ? digitalRead(HX_DT[ch]) : 0;
     digitalWrite(HX_CLOCK[ch], LOW);
     SREG = oldSREG;
-    delayMicroseconds(4);
+    if (i < 24) bits = (bits << 1) | b;
+    delayMicroseconds(1);
   }
   if (bits & 0x800000UL) bits |= 0xFF000000UL;
   outRaw = (long)bits;
@@ -563,10 +570,10 @@ bool captureAverageRaw(byte ch, long &avgOut, unsigned long timeoutMs = 1500UL) 
   return false;
 }
 
-bool performTare(byte ch, bool saveEeprom = false) {
+bool performTare(byte ch, bool saveEeprom = false, unsigned long timeoutMs = 1500UL) {
   if (ch >= NUM_TRAYS) return false;
   long avg;
-  if (!captureAverageRaw(ch, avg)) {
+  if (!captureAverageRaw(ch, avg, timeoutMs)) {
     trays[ch].health = SENSOR_ERROR;
     return false;
   }
@@ -740,20 +747,28 @@ void evaluateOutputs() {
     if (outputs[s].sterilActive) targetCode = 2;
     else if (outputs[s].normalActive && blinkPhaseOn) targetCode = 1;
 
-    if (ledsNeedHardwareRefresh || outputs[s].currentStateCode != targetCode) {
-      outputs[s].currentStateCode = targetCode;
-      if (targetCode == 2) writeStripHardware(s, 150, 0, 255);
-      else if (targetCode == 1) writeStripHardware(s, 120, 120, 120);
-      else writeStripHardware(s, 0, 0, 0);
+    // 시리얼 명령 수신 중에는 WS2812B cli() 호출을 잠시 보류하여 UART 오버런 방지
+    if (Serial.available() == 0 && serialRxLen == 0) {
+      if (ledsNeedHardwareRefresh || outputs[s].currentStateCode != targetCode) {
+        outputs[s].currentStateCode = targetCode;
+        if (targetCode == 2) writeStripHardware(s, 150, 0, 255);
+        else if (targetCode == 1) writeStripHardware(s, 120, 120, 120);
+        else writeStripHardware(s, 0, 0, 0);
+      }
     }
   }
-  ledsNeedHardwareRefresh = false;
+  if (Serial.available() == 0 && serialRxLen == 0) {
+    ledsNeedHardwareRefresh = false;
+  }
 }
 
 // ==============================================================================
 // 11. 센서 폴링 (현관문 A0, 우산 IR A3, 로드셀 CH1/CH2)
 // ==============================================================================
 void pollSensors() {
+  // 시리얼 데이터를 읽는 도중에는 센서 cli() 폴링을 건너뛰고 즉시 수신 우선 처리
+  if (Serial.available() > 0 || serialRxLen > 0) return;
+
   unsigned long now = millis();
 
   // 1) 현관문 (A0)
@@ -789,6 +804,7 @@ void pollSensors() {
 
   // 3) 로드셀 1·2번 칸
   for (byte i = 0; i < NUM_TRAYS; ++i) {
+    if (Serial.available() > 0) return;
     long raw;
     if (readHX711Raw(i, raw)) {
       if (raw == 8388607L || raw == -8388608L) {
@@ -876,6 +892,23 @@ unsigned long remainingMs(bool active, unsigned long untilMs) {
 
 bool serialLineReady = false;
 
+void setCommMode(CommMode nextMode) {
+  if (commMode == nextMode) return;
+  commMode = nextMode;
+  if (commMode == MODE_SERIAL) {
+    bluetooth.end(); // 시리얼 통신 중에는 블루투스(SoftwareSerial) 완전 비활성화
+    btRxLen = 0;
+    btRxOverflow = false;
+    Serial.println(F("\n>> [MODE] SERIAL TEST MODE (BT OFF | Type 'BT ON' to resume BT)"));
+  } else {
+    liveMonitorEnabled = false;
+    bluetooth.begin(9600);
+    lastStateSentMs = millis();
+    stateDirty = true;
+    Serial.println(F("\n>> [MODE] BLUETOOTH MODE ACTIVE (9600bps)"));
+  }
+}
+
 void pumpSerialRx() {
   unsigned long now = millis();
   while (Serial.available() && !serialLineReady) {
@@ -887,8 +920,13 @@ void pumpSerialRx() {
         serialRxBuf[serialRxLen] = '\0';
         serialLineReady = true;
       }
-    } else if (c >= 32 && c <= 126 && serialRxLen + 1 < sizeof(serialRxBuf)) {
-      serialRxBuf[serialRxLen++] = c;
+    } else if (c >= 32 && c <= 126) {
+      if (commMode != MODE_SERIAL) {
+        setCommMode(MODE_SERIAL);
+      }
+      if (serialRxLen + 1 < sizeof(serialRxBuf)) {
+        serialRxBuf[serialRxLen++] = c;
+      }
     }
   }
 }
@@ -945,18 +983,19 @@ void sendStateSnapshot(Stream &out) {
 }
 
 void sendAckP(const char* reqId, PGM_P statusP, PGM_P reasonP) {
-  bluetooth.print(F("{\"type\":\"ack\",\"req\":\""));
-  if (reqId && reqId[0]) bluetooth.print(reqId);
-  else bluetooth.print(F("none"));
-  bluetooth.print(F("\",\"status\":\""));
-  bluetooth.print((const __FlashStringHelper*)statusP);
-  bluetooth.print('"');
+  Stream &out = (commMode == MODE_SERIAL) ? (Stream&)Serial : (Stream&)bluetooth;
+  out.print(F("{\"type\":\"ack\",\"req\":\""));
+  if (reqId && reqId[0]) out.print(reqId);
+  else out.print(F("none"));
+  out.print(F("\",\"status\":\""));
+  out.print((const __FlashStringHelper*)statusP);
+  out.print('"');
   if (reasonP) {
-    bluetooth.print(F(",\"reason\":\""));
-    bluetooth.print((const __FlashStringHelper*)reasonP);
-    bluetooth.print('"');
+    out.print(F(",\"reason\":\""));
+    out.print((const __FlashStringHelper*)reasonP);
+    out.print('"');
   }
-  bluetooth.println('}');
+  out.println('}');
 }
 
 // snprintf 없이 PROGMEM 키를 직접 매칭하여 Flash/SRAM 절약
@@ -1210,6 +1249,9 @@ void handleJsonMessage(const char* line, Stream &replyStream) {
 // ==============================================================================
 void printCalibrationHelp() {
   Serial.println(F("\n=== [ AMATTA SERIAL TEST & CALIBRATION ] ==="));
+  Serial.print(F(" CURRENT MODE: "));
+  Serial.println((commMode == MODE_SERIAL) ? F("SERIAL TEST (BT OFF)") : F("BLUETOOTH (9600bps)"));
+  Serial.println(F(" BT ON (or EXIT) : Resume Bluetooth Mode"));
   Serial.println(F(" STATUS | MON (M) | SENSOR (D) | BT SEND"));
   Serial.println(F(" CAL SHOW | TARE [1|2] | CAL <1|2> <g>"));
   Serial.println(F(" SCALE <1|2> <val> | TH <1|2> <det> <rel> | DZ <1|2> <g>"));
@@ -1470,9 +1512,25 @@ void handleSerialCommand(char* line) {
       Serial.println(F(">> SIM ITEM OK"));
     }
   }
-  else if (strcmp_P(cmd, PSTR("BT")) == 0) {
-    sendStateSnapshot(bluetooth);
-    sendStateSnapshot(Serial);
+  else if (strcmp_P(cmd, PSTR("BT")) == 0 || strcmp_P(cmd, PSTR("MODE")) == 0) {
+    char* sub = strtok(NULL, " \t");
+    if (sub) toUpperStr(sub);
+    if (sub && (strcmp_P(sub, PSTR("ON")) == 0 || strcmp_P(sub, PSTR("BT")) == 0 || strcmp_P(sub, PSTR("1")) == 0)) {
+      btPeerActive = true;
+      setCommMode(MODE_BT);
+    } else if (sub && strcmp_P(sub, PSTR("SERIAL")) == 0) {
+      setCommMode(MODE_SERIAL);
+    } else {
+      // 시리얼 모드에서 수동 1회 BT 패킷 전송 테스트 (BT 또는 BT SEND)
+      if (commMode == MODE_SERIAL) bluetooth.begin(9600);
+      sendStateSnapshot(bluetooth);
+      if (commMode == MODE_SERIAL) bluetooth.end();
+      sendStateSnapshot(Serial);
+    }
+  }
+  else if (strcmp_P(cmd, PSTR("EXIT")) == 0 || strcmp_P(cmd, PSTR("BTON")) == 0) {
+    btPeerActive = true;
+    setCommMode(MODE_BT);
   }
   else if (strcmp_P(cmd, PSTR("SAVE")) == 0) {
     saveConfigToEeprom();
@@ -1495,35 +1553,47 @@ void handleSerialCommand(char* line) {
 void pollStreams() {
   unsigned long now = millis();
 
-  while (bluetooth.available()) {
-    char c = (char)bluetooth.read();
-    lastBtRxMs = now;
-    if (c == '\r') continue;
-    if (c == '\n') {
-      if (!btRxOverflow && btRxLen > 0) {
-        btRxBuf[btRxLen] = '\0';
-        handleJsonMessage(btRxBuf, bluetooth);
-      } else if (btRxOverflow) {
-        sendAckP(NULL, PSTR("rejected"), PSTR("frame_too_long"));
-      }
-      btRxLen = 0;
-      btRxOverflow = false;
-    } else {
-      if (btRxLen + 1 < sizeof(btRxBuf)) btRxBuf[btRxLen++] = c;
-      else btRxOverflow = true;
-    }
-  }
-  if (btRxLen > 0 && (now - lastBtRxMs > 1500UL)) {
-    btRxLen = 0;
-    btRxOverflow = false;
-  }
-
+  // 1) PC 시리얼(115200bps) 입력 최우선 확인 -> 입력 감지 시 자동으로 MODE_SERIAL 전환
   pumpSerialRx();
   if (serialLineReady || (serialRxLen > 0 && (now - lastSerialRxMs > 120UL))) {
     serialRxBuf[serialRxLen] = '\0';
     serialRxLen = 0;
     serialLineReady = false;
     handleSerialCommand(serialRxBuf);
+    return;
+  }
+
+  // 2) 시리얼 무입력 타임아웃(180초) 경과 시 기본 블루투스 모드(MODE_BT)로 자동 복귀
+  if (commMode == MODE_SERIAL && !liveMonitorEnabled && serialRxLen == 0 &&
+      (now - lastSerialRxMs >= SERIAL_MODE_TIMEOUT_MS)) {
+    setCommMode(MODE_BT);
+  }
+
+  // 3) 블루투스 모드(MODE_BT)일 때만 HC-06 수신 처리 (시리얼 모드에서는 완전 비활성화)
+  if (commMode == MODE_BT) {
+    while (bluetooth.available()) {
+      char c = (char)bluetooth.read();
+      lastBtRxMs = now;
+      btPeerActive = true;
+      if (c == '\r') continue;
+      if (c == '\n') {
+        if (!btRxOverflow && btRxLen > 0) {
+          btRxBuf[btRxLen] = '\0';
+          handleJsonMessage(btRxBuf, bluetooth);
+        } else if (btRxOverflow) {
+          sendAckP(NULL, PSTR("rejected"), PSTR("frame_too_long"));
+        }
+        btRxLen = 0;
+        btRxOverflow = false;
+      } else {
+        if (btRxLen + 1 < sizeof(btRxBuf)) btRxBuf[btRxLen++] = c;
+        else btRxOverflow = true;
+      }
+    }
+    if (btRxLen > 0 && (now - lastBtRxMs > 1500UL)) {
+      btRxLen = 0;
+      btRxOverflow = false;
+    }
   }
 }
 
@@ -1532,6 +1602,7 @@ void pollStreams() {
 // ==============================================================================
 void setup() {
   Serial.begin(115200);
+  commMode = MODE_BT;
   bluetooth.begin(9600);
 
   pinMode(FAN_PIN, OUTPUT);
@@ -1565,7 +1636,7 @@ void setup() {
     digitalWrite(HX_CLOCK[i], LOW);
     trays[i].health = SENSOR_WAITING;
     trays[i].lastSampleMs = now;
-    performTare(i, false);
+    performTare(i, false, 250UL); // 부팅 시 빠른 초기 영점 확인 (최대 250ms)
   }
 
   Wire.begin();
@@ -1574,7 +1645,7 @@ void setup() {
   initWeatherDisplayWait();
   refreshLcdWeather(true);
 
-  Serial.println(F("AMATTA READY (Type HELP)"));
+  Serial.println(F("AMATTA READY [DEFAULT: BT MODE | Type any cmd for SERIAL MODE]"));
   stateDirty = true;
 }
 
@@ -1585,12 +1656,16 @@ void loop() {
   refreshLcdWeather(false);
 
   unsigned long now = millis();
-  // 시리얼 모니터 입력 중(최근 3초 이내)에는 상태 변경(stateDirty) 시에만 BT 전송하여 SoftwareSerial 인터럽트 충돌 방지
-  bool serialBusy = (serialRxLen > 0) || Serial.available() || (now - lastSerialRxMs < 3000UL);
-  if (stateDirty || (!serialBusy && (now - lastStateSentMs >= 2000UL))) {
+  // 기본 블루투스 모드(MODE_BT)일 때만 블루투스로 상태 전송 (시리얼 모드에서는 BT 전송 안 함)
+  if (commMode == MODE_BT) {
+    if (stateDirty || (btPeerActive && (now - lastStateSentMs >= STATE_HEARTBEAT_MS))) {
+      stateDirty = false;
+      lastStateSentMs = now;
+      sendStateSnapshot(bluetooth);
+    }
+  } else {
+    // 시리얼 모드에서는 자동 BT 송신을 하지 않음
     stateDirty = false;
-    lastStateSentMs = now;
-    sendStateSnapshot(bluetooth);
   }
 
   if (liveMonitorEnabled && (now - lastMonitorPrintMs >= 500UL)) {
