@@ -1,38 +1,11 @@
 /*
  * ==============================================================================
- * 프로젝트: 아마따 (AMATTA) - 스마트 트레이 Arduino UNO R3 메인 펌웨어 (v1.0)
+ * 프로젝트: 아마따 (AMATTA) - 스마트 트레이 Arduino UNO R3 메인 펌웨어 (v1.1)
  * ==============================================================================
- *
- * [핵심 사양 및 확정 요구사항 반영]
- * 1. 하드웨어 핀 배치:
- *    - 1번 트레이 로드셀 (HX711): DT = D2, SCK = D3
- *    - 2번 트레이 로드셀 (HX711): DT = D4, SCK = D5
- *    - 3번 우산 공간 적외선 센서 (IR): OUT = A3 (감지 시 LOW)
- *    - 현관문 자석 도어센서 (리드스위치): A0 (INPUT_PULLUP, 닫힘 LOW / 열림 HIGH)
- *      (* 미사용 뚜껑 A1, 창문 A2 도어센서 제외)
- *    - 공간별 공용 WS2812B LED 바 (각 8구): 1번칸 = D8, 2번칸 = D9, 3번(우산)칸 = D10
- *      (외부 라이브러리 불필요, 순수 AVR 16MHz 고속 어셈블리 드라이버 내장)
- *    - 우산 건조 쿨링팬: D11 (HIGH = ON, LOW = OFF)
- *    - 블루투스 모듈 (HC-06): RX = D12(HC-06 TX), TX = D13(HC-06 RX, 분압) / 9600bps
- *    - 1602 I2C LCD: SDA = A4, SCL = A5 (순수 Wire.h 제어)
- *
- * 2. 동작 및 제어 정책:
- *    - [물건/우산 거치 감지]: 일반 LED 점등 동작 없이 즉시 소등 유지 + 앱으로 즉각 상태(state) 패킷 전송.
- *    - [공유 LED 우선순위]:
- *      1순위) 살균 점등("steril"): 보라색 RGB(150, 0, 255) 연속 점등 (5/10/20/30초 타이머)
- *      2순위) 일반 점등("normal"): 현관문 열림 시(led_en && led_door) 물건이 남아 있는 칸만
- *             백색 RGB(120, 120, 120) 1.5초 주기 점멸 (1500ms ON / 1500ms OFF).
- *             물건을 수거하거나, 새로 거치하거나, 현관문이 닫히면 즉시 소등.
- *    - [자동 실행 및 중지]:
- *      앱에서 내려보낸 설정값(EEPROM 저장)에 따라 거치 시/문 열림 시 살균 및 우산 건조 팬을
- *      아두이노가 자체 구동하며, 내부 상태 변경 즉시 앱으로 JSON 패킷을 전송.
- *      살균/팬 동작 중 물건이나 우산이 제거되면 즉시 소등/정지하고 앱에 통지.
- *    - [시리얼 캘리브레이션]:
- *      USB 시리얼 모니터(115200bps)로 실시간 영점(TARE), 분동 보정(CAL), 감도(TH),
- *      스케일(SCALE) 조정 및 EEPROM 영구 저장 지원.
- *    - [1602 LCD 날씨 표시]:
- *      좌측 2x2 커스텀 도트 아이콘(해/구름/비/눈/대기) + 우측 13칸 영문 날씨 및 비 예보 시간대.
- *      기상 정보 수신 전에는 대기 아이콘과 함께 "WAITING..." / "WEATHER INFO" 표시.
+ * [메모리 최적화]
+ * - Flash(프로그램 저장 공간) & SRAM(동적 메모리) 대폭 다이어트 적용
+ * - 무거운 snprintf / atof / float 연산 제거 -> 고정소수점(0.1g 단위, deci-grams) 연산
+ * - 모든 상수 문자열 PROGMEM(F() / PSTR()) 배치로 SRAM 여유 공간 대폭 확보
  * ==============================================================================
  */
 
@@ -44,7 +17,6 @@
 #include <avr/interrupt.h>
 #include <stdlib.h>
 #include <string.h>
-#include <math.h>
 
 // ==============================================================================
 // 1. 핀 매핑 및 하드웨어 상수 정의
@@ -66,45 +38,44 @@ const byte IR_PIN    = A3;                     // 3번 공간 우산 감지 IR �
 const byte DOOR_CLOSED_LEVEL = LOW;            // 자석 부착(닫힘) = LOW, 분리(열림) = HIGH
 const byte IR_DETECTED_LEVEL = LOW;            // 장애물 감지 = LOW
 
-const unsigned long DEBOUNCE_MS       = 40UL;
-const unsigned long STATE_HEARTBEAT_MS = 1000UL; // 1초 주기 상태 스냅샷 전송
-const unsigned long NORMAL_BLINK_MS    = 1500UL; // 일반 백색 LED 1.5초 점멸 주기
-const unsigned long NORMAL_MAX_MS      = 60000UL;// 문 열림 일반 점등 최대 유지 시간 (60초)
-const unsigned long HX_TIMEOUT_MS      = 1500UL; // 로드셀 응답 타임아웃
+const unsigned long DEBOUNCE_MS        = 40UL;
+const unsigned long STATE_HEARTBEAT_MS = 1000UL;  // 1초 주기 상태 스냅샷 전송
+const unsigned long NORMAL_BLINK_MS    = 1500UL;  // 일반 백색 LED 1.5초 점멸 주기
+const unsigned long NORMAL_MAX_MS      = 60000UL; // 문 열림 일반 점등 최대 유지 시간 (60초)
+const unsigned long HX_TIMEOUT_MS      = 1500UL;  // 로드셀 응답 타임아웃
 
 SoftwareSerial bluetooth(BT_RX_PIN, BT_TX_PIN);
 
 // ==============================================================================
-// 2. EEPROM 저장용 설정 및 보정 데이터 구조체
+// 2. EEPROM 저장용 설정 및 보정 데이터 구조체 (고정소수점 최적화)
 // ==============================================================================
-const uint16_t EEPROM_MAGIC = 0xA410;
+const uint16_t EEPROM_MAGIC = 0xA412;
 
-struct SpaceConfig {
-  bool ledEnabled;       // 일반 LED 활성화 여부
-  bool ledOnDoor;        // 문 열림 시 미수거 알림 점멸 여부
-  bool sterilEnabled;    // 보라색 살균 LED 활성화 여부
-  bool sterilOnDetect;   // 물건/우산 거치 시 자동 살균 시작
-  bool sterilOnDoor;     // 문 열림 시 자동 살균 시작
-  uint8_t sterilSec;     // 살균 시간 (5, 10, 20, 30초)
-};
+// 공간별 설정 비트 플래그
+const uint8_t CFG_LED_EN        = 0x01;
+const uint8_t CFG_LED_DOOR      = 0x02;
+const uint8_t CFG_STERIL_EN     = 0x04;
+const uint8_t CFG_STERIL_DETECT = 0x08;
+const uint8_t CFG_STERIL_DOOR   = 0x10;
 
 struct PersistentData {
   uint16_t magic;
   uint16_t bootCount;
-  long tareOffset[NUM_TRAYS];     // 로드셀 영점 Raw 기준값
-  float scaleFactor[NUM_TRAYS];   // 1g당 Raw 변화량 (Scale factor)
-  float detectGrams[NUM_TRAYS];   // 물건 감지 문턱값 (기본 15.0g)
-  float releaseGrams[NUM_TRAYS];  // 물건 해제 문턱값 (히스테리시스, 기본 8.0g)
-  float deadzoneGrams[NUM_TRAYS]; // 0.0g 고정 데드존 (기본 3.0g)
-  bool tareValid[NUM_TRAYS];      // 영점 저장 여부
-  SpaceConfig spaces[NUM_SPACES]; // 1, 2, 3번 공간 설정
-  uint8_t fanDurationSec;         // 우산 건조 팬 동작 시간 (0, 15, 30, 60초)
+  long tareOffset[NUM_TRAYS];       // 로드셀 영점 Raw 기준값
+  long scaleX10[NUM_TRAYS];         // (1g당 Raw 변화량) * 10 (예: 25.0 -> 250)
+  int16_t detectDg[NUM_TRAYS];      // 감지 문턱값 (0.1g 단위, 기본 150 = 15.0g)
+  int16_t releaseDg[NUM_TRAYS];     // 해제 문턱값 (0.1g 단위, 기본 80  = 8.0g)
+  int16_t deadzoneDg[NUM_TRAYS];    // 데드존 (0.1g 단위, 기본 30 = 3.0g)
+  uint8_t tareValidMask;            // bit0: CH1, bit1: CH2
+  uint8_t spaceFlags[NUM_SPACES];   // CFG_* 비트마스크
+  uint8_t sterilSec[NUM_SPACES];    // 살균 시간 (5, 10, 20, 30초)
+  uint8_t fanDurationSec;           // 우산 건조 팬 시간 (0, 15, 30, 60초)
   uint16_t crc;
 };
 
 PersistentData config;
 uint32_t txSeq = 0;
-bool stateDirty = false;          // 내부 값 변경 시 즉시 앱 전송 플래그
+bool stateDirty = false;
 unsigned long lastStateSentMs = 0;
 
 // ==============================================================================
@@ -115,7 +86,7 @@ enum LedLogicalMode : uint8_t { LED_OFF = 0, LED_NORMAL_BLINK = 1, LED_STERIL = 
 
 struct TrayRuntime {
   long rawFiltered;
-  float weightGrams;
+  int16_t weightDg;                 // 0.1g 단위 (0 ~ 30000 -> 0.0g ~ 3000.0g)
   bool present;
   SensorHealth health;
   unsigned long lastSampleMs;
@@ -123,47 +94,40 @@ struct TrayRuntime {
   bool candidatePresent;
 };
 
-struct UmbrellaRuntime {
+struct DigitalSensorRuntime {
   byte rawLevel;
   byte stableLevel;
   unsigned long lastDebounceMs;
-  bool present;
-  SensorHealth health;
-};
-
-struct DoorRuntime {
-  byte rawLevel;
-  byte stableLevel;
-  unsigned long lastDebounceMs;
-  bool isOpen;
+  bool active;                      // door: isOpen, umbrella: present
   SensorHealth health;
 };
 
 struct SpaceOutputRuntime {
-  bool normalActive;               // 문 열림 미수거 백색 점멸 활성 여부
-  unsigned long normalStartedMs;   // 일반 점멸 시작 시각
-  bool sterilActive;               // 보라색 살균 활성 여부
-  unsigned long sterilUntilMs;     // 살균 종료 예정 시각 (millis)
-  char activeReqId[16];            // 수동 명령 요청 ID 보관
-  byte currentR, currentG, currentB;
+  bool normalActive;
+  unsigned long normalStartedMs;
+  bool sterilActive;
+  unsigned long sterilUntilMs;
+  char activeReqId[12];
+  byte currentStateCode;            // 0:OFF, 1:WHITE, 2:PURPLE
 };
 
 struct FanRuntime {
   bool active;
   unsigned long untilMs;
-  char activeReqId[16];
+  char activeReqId[12];
 };
 
 TrayRuntime trays[NUM_TRAYS];
-UmbrellaRuntime umbrella;
-DoorRuntime door;
+DigitalSensorRuntime umbrella;
+DigitalSensorRuntime door;
 SpaceOutputRuntime outputs[NUM_SPACES];
 FanRuntime fan;
 
-// 일반 LED 백색 점멸 타이머 (1.5초 ON / 1.5초 OFF)
 bool blinkPhaseOn = true;
 unsigned long lastBlinkToggleMs = 0;
 bool ledsNeedHardwareRefresh = true;
+bool liveMonitorEnabled = false;
+unsigned long lastMonitorPrintMs = 0;
 
 // ==============================================================================
 // 4. 1602 I2C LCD 및 2x2 날씨 도트 아이콘 (PROGMEM)
@@ -172,7 +136,7 @@ byte lcdAddress = 0x27;
 bool lcdAvailable = false;
 
 enum WeatherIconType : uint8_t {
-  W_ICON_WAITING = 0, // 기상 정보 대기중 아이콘 (시계/전파 모양)
+  W_ICON_WAITING = 0, // 기상 정보 대기중 아이콘
   W_ICON_SUNNY   = 1, // 해 (SUNNY)
   W_ICON_CLOUDY  = 2, // 구름 (CLOUDY)
   W_ICON_RAIN    = 3, // 비 (RAIN)
@@ -180,44 +144,43 @@ enum WeatherIconType : uint8_t {
   W_ICON_NONE    = 5  // 수신 실패/만료 (NO DATA)
 };
 
-// 각 큰 아이콘은 좌상(0), 우상(1), 좌하(2), 우하(3) 4개의 5x8 도트 문자로 구성 (총 32바이트)
 const byte WEATHER_ICONS[6][4][8] PROGMEM = {
-  // 0: W_ICON_WAITING (시계/대기 아이콘)
+  // 0: W_ICON_WAITING
   {
     {0b00111, 0b01000, 0b10000, 0b10001, 0b10001, 0b10001, 0b10001, 0b01000},
     {0b11100, 0b00010, 0b00001, 0b10001, 0b10001, 0b10001, 0b11101, 0b00010},
     {0b01000, 0b10000, 0b10000, 0b10000, 0b01000, 0b00111, 0b00000, 0b00000},
     {0b00010, 0b00001, 0b00001, 0b00001, 0b00010, 0b11100, 0b00000, 0b00000}
   },
-  // 1: W_ICON_SUNNY (해 아이콘)
+  // 1: W_ICON_SUNNY
   {
     {0b00100, 0b10100, 0b01001, 0b00011, 0b11011, 0b00011, 0b01001, 0b10100},
     {0b00100, 0b00101, 0b10010, 0b11000, 0b11011, 0b11000, 0b10010, 0b00101},
     {0b10100, 0b01001, 0b00011, 0b11011, 0b00011, 0b01001, 0b10100, 0b00100},
     {0b00101, 0b10010, 0b11000, 0b11011, 0b11000, 0b10010, 0b00101, 0b00100}
   },
-  // 2: W_ICON_CLOUDY (구름 아이콘)
+  // 2: W_ICON_CLOUDY
   {
     {0b00000, 0b00000, 0b00011, 0b00111, 0b01111, 0b11111, 0b11111, 0b01111},
     {0b00000, 0b00000, 0b11000, 0b11100, 0b11110, 0b11111, 0b11111, 0b11110},
     {0b01111, 0b00111, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000},
     {0b11110, 0b11100, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000}
   },
-  // 3: W_ICON_RAIN (비 아이콘)
+  // 3: W_ICON_RAIN
   {
     {0b00000, 0b00011, 0b00111, 0b01111, 0b11111, 0b11111, 0b01111, 0b00000},
     {0b00000, 0b11000, 0b11100, 0b11110, 0b11111, 0b11111, 0b11110, 0b00000},
     {0b00101, 0b01010, 0b10100, 0b00101, 0b01010, 0b10100, 0b00000, 0b00000},
     {0b01010, 0b10100, 0b01010, 0b01010, 0b10100, 0b01000, 0b00000, 0b00000}
   },
-  // 4: W_ICON_SNOW (눈 아이콘)
+  // 4: W_ICON_SNOW
   {
     {0b00000, 0b00011, 0b00111, 0b01111, 0b11111, 0b11111, 0b01111, 0b00000},
     {0b00000, 0b11000, 0b11100, 0b11110, 0b11111, 0b11111, 0b11110, 0b00000},
     {0b01010, 0b00100, 0b01010, 0b00000, 0b01010, 0b00100, 0b01010, 0b00000},
     {0b01010, 0b00100, 0b01010, 0b00000, 0b01010, 0b00100, 0b01010, 0b00000}
   },
-  // 5: W_ICON_NONE (정보 없음 / 느낌표 박스)
+  // 5: W_ICON_NONE
   {
     {0b01111, 0b10000, 0b10000, 0b10001, 0b10001, 0b10001, 0b10001, 0b10000},
     {0b11110, 0b00001, 0b00001, 0b10001, 0b10001, 0b10001, 0b10001, 0b00001},
@@ -227,40 +190,81 @@ const byte WEATHER_ICONS[6][4][8] PROGMEM = {
 };
 
 struct WeatherDisplayState {
-  bool receivedOnce;               // 부팅 후 날씨 패킷을 한 번이라도 받았는지 여부
-  bool valid;                      // 현재 날씨 데이터 유효 여부
-  WeatherIconType icon;            // 현재 아이콘 종류
-  WeatherIconType loadedIcon;      // LCD CGRAM에 로드된 아이콘 종류
-  char line1[14];                  // 우측 1행 텍스트 (최대 13자)
-  char windows[3][14];             // 우측 2행 순환 텍스트 (최대 3개, 각 13자)
+  bool receivedOnce;
+  bool valid;
+  WeatherIconType icon;
+  WeatherIconType loadedIcon;
+  char line1[14];
+  char windows[2][14];              // 최대 2개 구간 순환 (SRAM 절약)
   uint8_t windowCount;
   uint8_t currentWindowIdx;
   unsigned long lastWindowCycleMs;
   unsigned long receivedAtMs;
-  unsigned long ttlMs;             // 만료 시간 (0이면 만료 없음)
+  unsigned long ttlMs;
   bool dirty;
 };
 
 WeatherDisplayState weatherLcd;
 
-// 수신 버퍼
-char btRxBuf[220];
+// 수신 버퍼 (SRAM 최적화)
+char btRxBuf[168];
 byte btRxLen = 0;
 bool btRxOverflow = false;
 unsigned long lastBtRxMs = 0;
 
-char serialRxBuf[96];
+char serialRxBuf[80];
 byte serialRxLen = 0;
 unsigned long lastSerialRxMs = 0;
 
-// 함수 프로토타입 선언
-void sendAck(const char* reqId, const char* status, const char* reason = NULL);
+void sendAckP(const char* reqId, PGM_P statusP, PGM_P reasonP = NULL);
 void sendStateSnapshot(Stream &out);
-void evaluateOutputs();
 void refreshLcdWeather(bool force = false);
 
 // ==============================================================================
-// 5. 순수 AVR 고속 WS2812B 드라이버 (16MHz 정밀 타이밍)
+// 5. 유틸리티: 고정소수점(0.1 단위) 파싱 및 출력 (float/atof 완전 대체)
+// ==============================================================================
+// 문자열 "15.4" -> 154, "200" -> 2000 반환
+long parseDeci(const char* s) {
+  if (!s) return 0;
+  while (*s == ' ' || *s == '\t') ++s;
+  bool neg = (*s == '-');
+  if (neg || *s == '+') ++s;
+  long whole = 0;
+  while (*s >= '0' && *s <= '9') {
+    whole = whole * 10L + (*s - '0');
+    ++s;
+  }
+  long frac = 0;
+  if (*s == '.') {
+    ++s;
+    if (*s >= '0' && *s <= '9') frac = (*s - '0');
+  }
+  long res = whole * 10L + frac;
+  return neg ? -res : res;
+}
+
+void printDeci(Stream &out, long valDg) {
+  if (valDg < 0) {
+    out.print('-');
+    valDg = -valDg;
+  }
+  out.print(valDg / 10L);
+  out.print('.');
+  out.print(valDg % 10L);
+}
+
+void copyStrP(char* dst, PGM_P srcP, size_t maxLen) {
+  strncpy_P(dst, srcP, maxLen - 1);
+  dst[maxLen - 1] = '\0';
+}
+
+void toUpperStr(char* s) {
+  if (!s) return;
+  for (; *s; ++s) if (*s >= 'a' && *s <= 'z') *s -= 32;
+}
+
+// ==============================================================================
+// 6. 순수 AVR 고속 WS2812B 드라이버 (16MHz 정밀 타이밍)
 // ==============================================================================
 void ws2812Send(byte pin, const byte *data, uint16_t len) {
   if (len == 0) return;
@@ -305,7 +309,7 @@ void writeStripHardware(byte spaceIdx, byte r, byte g, byte b) {
   if (spaceIdx >= NUM_SPACES) return;
   byte buf[LEDS_PER_STRIP * 3];
   for (byte i = 0; i < LEDS_PER_STRIP; ++i) {
-    buf[i * 3 + 0] = g; // WS2812B는 GRB 순서
+    buf[i * 3 + 0] = g;
     buf[i * 3 + 1] = r;
     buf[i * 3 + 2] = b;
   }
@@ -316,7 +320,7 @@ void writeStripHardware(byte spaceIdx, byte r, byte g, byte b) {
 }
 
 // ==============================================================================
-// 6. 1602 I2C LCD 드라이버 및 2x2 날씨 렌더링
+// 7. 1602 I2C LCD 드라이버 및 2x2 날씨 렌더링
 // ==============================================================================
 #define LCD_BACKLIGHT 0x08
 #define LCD_ENABLE    0x04
@@ -348,8 +352,7 @@ void lcdChar(char c) {
 }
 
 void lcdSetCursor(byte col, byte row) {
-  byte rowOffsets[] = {0x00, 0x40};
-  lcdCommand(0x80 | (col + rowOffsets[row]));
+  lcdCommand(0x80 | (col + (row ? 0x40 : 0x00)));
 }
 
 void lcdLoadWeatherIcon(WeatherIconType iconType) {
@@ -357,8 +360,7 @@ void lcdLoadWeatherIcon(WeatherIconType iconType) {
   for (byte slot = 0; slot < 4; ++slot) {
     lcdCommand(0x40 | (slot << 3));
     for (byte row = 0; row < 8; ++row) {
-      byte pattern = pgm_read_byte(&WEATHER_ICONS[iconType][slot][row]);
-      lcdSendByte(pattern, 1);
+      lcdSendByte(pgm_read_byte(&WEATHER_ICONS[iconType][slot][row]), 1);
     }
   }
   lcdCommand(0x80);
@@ -371,13 +373,9 @@ bool initI2CLcd() {
     lcdAddress = 0x27;
   } else {
     Wire.beginTransmission(0x3F);
-    if (Wire.endTransmission() == 0) {
-      lcdAddress = 0x3F;
-    } else {
-      return false;
-    }
+    if (Wire.endTransmission() == 0) lcdAddress = 0x3F;
+    else return false;
   }
-
   delay(50);
   lcdWriteNibble(0x30, 0); delay(5);
   lcdWriteNibble(0x30, 0); delayMicroseconds(150);
@@ -404,15 +402,11 @@ void lcdPrintPadded13(const char* text) {
   }
 }
 
-void initWeatherDisplayWait() {
-  weatherLcd.receivedOnce = false;
-  weatherLcd.valid = false;
-  weatherLcd.icon = W_ICON_WAITING;
-  weatherLcd.loadedIcon = (WeatherIconType)255;
-  strncpy(weatherLcd.line1, "WAITING...", sizeof(weatherLcd.line1) - 1);
-  weatherLcd.line1[13] = '\0';
-  strncpy(weatherLcd.windows[0], "WEATHER INFO", sizeof(weatherLcd.windows[0]) - 1);
-  weatherLcd.windows[0][13] = '\0';
+void setWeatherPreset(WeatherIconType ic, PGM_P l1P, PGM_P l2P, bool isValid) {
+  weatherLcd.valid = isValid;
+  weatherLcd.icon = ic;
+  copyStrP(weatherLcd.line1, l1P, sizeof(weatherLcd.line1));
+  copyStrP(weatherLcd.windows[0], l2P, sizeof(weatherLcd.windows[0]));
   weatherLcd.windowCount = 1;
   weatherLcd.currentWindowIdx = 0;
   weatherLcd.lastWindowCycleMs = millis();
@@ -420,30 +414,26 @@ void initWeatherDisplayWait() {
   weatherLcd.dirty = true;
 }
 
+void initWeatherDisplayWait() {
+  weatherLcd.receivedOnce = false;
+  weatherLcd.loadedIcon = (WeatherIconType)255;
+  setWeatherPreset(W_ICON_WAITING, PSTR("WAITING..."), PSTR("WEATHER INFO"), false);
+}
+
 void setWeatherNoData() {
-  weatherLcd.valid = false;
-  weatherLcd.icon = W_ICON_NONE;
-  strncpy(weatherLcd.line1, "NO DATA", sizeof(weatherLcd.line1) - 1);
-  weatherLcd.line1[13] = '\0';
-  weatherLcd.windows[0][0] = '\0';
-  weatherLcd.windowCount = 1;
-  weatherLcd.currentWindowIdx = 0;
-  weatherLcd.ttlMs = 0;
-  weatherLcd.dirty = true;
+  setWeatherPreset(W_ICON_NONE, PSTR("NO DATA"), PSTR(""), false);
 }
 
 void refreshLcdWeather(bool force) {
   if (!lcdAvailable) return;
   unsigned long now = millis();
 
-  // 1) 날씨 유효시간(TTL) 만료 검사
   if (weatherLcd.receivedOnce && weatherLcd.valid && weatherLcd.ttlMs > 0) {
     if (now - weatherLcd.receivedAtMs >= weatherLcd.ttlMs) {
       setWeatherNoData();
     }
   }
 
-  // 2) 비 예보 시간대가 여러 개일 때 3초 간격 순환
   if (weatherLcd.valid && weatherLcd.windowCount > 1) {
     if (now - weatherLcd.lastWindowCycleMs >= 3000UL) {
       weatherLcd.lastWindowCycleMs = now;
@@ -455,29 +445,22 @@ void refreshLcdWeather(bool force) {
   if (!force && !weatherLcd.dirty) return;
   weatherLcd.dirty = false;
 
-  // 아이콘이 변경되었으면 CGRAM 0~3번 슬롯 교체
   if (weatherLcd.loadedIcon != weatherLcd.icon) {
     lcdLoadWeatherIcon(weatherLcd.icon);
   }
 
-  // 1행: [좌상(0)][우상(1)][공백][line1 (13칸)] -> 정확히 16칸
   lcdSetCursor(0, 0);
-  lcdChar(0);
-  lcdChar(1);
-  lcdChar(' ');
+  lcdChar(0); lcdChar(1); lcdChar(' ');
   lcdPrintPadded13(weatherLcd.line1);
 
-  // 2행: [좌하(2)][우하(3)][공백][window (13칸)] -> 정확히 16칸
   lcdSetCursor(0, 1);
-  lcdChar(2);
-  lcdChar(3);
-  lcdChar(' ');
+  lcdChar(2); lcdChar(3); lcdChar(' ');
   const char* line2 = (weatherLcd.windowCount > 0) ? weatherLcd.windows[weatherLcd.currentWindowIdx] : "";
   lcdPrintPadded13(line2);
 }
 
 // ==============================================================================
-// 7. EEPROM 설정 관리 (CRC16 검증 포함)
+// 8. EEPROM 설정 관리 (CRC16 검증 포함)
 // ==============================================================================
 uint16_t calcConfigCrc(const PersistentData &d) {
   const byte *p = (const byte *)&d;
@@ -502,21 +485,17 @@ void resetDefaultConfig() {
   config.bootCount = 1;
 
   for (byte i = 0; i < NUM_TRAYS; ++i) {
-    config.tareOffset[i]    = 0;
-    config.scaleFactor[i]   = 25.0f; // 기본 스케일 (시리얼 CAL 명령으로 정밀 보정 가능)
-    config.detectGrams[i]   = 15.0f; // 15g 이상 물건 있음
-    config.releaseGrams[i]  = 8.0f;  // 8g 이하 물건 없음
-    config.deadzoneGrams[i] = 3.0f;  // 3g 이내 흔들림 0.0g 고정
-    config.tareValid[i]     = false;
+    config.tareOffset[i] = 0;
+    config.scaleX10[i]   = 250; // 25.0 raw/g
+    config.detectDg[i]   = 150; // 15.0g
+    config.releaseDg[i]  = 80;  // 8.0g
+    config.deadzoneDg[i] = 30;  // 3.0g
   }
+  config.tareValidMask = 0;
 
   for (byte s = 0; s < NUM_SPACES; ++s) {
-    config.spaces[s].ledEnabled     = true;
-    config.spaces[s].ledOnDoor      = true;
-    config.spaces[s].sterilEnabled  = false;
-    config.spaces[s].sterilOnDetect = false;
-    config.spaces[s].sterilOnDoor   = false;
-    config.spaces[s].sterilSec      = 10;
+    config.spaceFlags[s] = CFG_LED_EN | CFG_LED_DOOR;
+    config.sterilSec[s]  = 10;
   }
   config.fanDurationSec = 0;
   saveConfigToEeprom();
@@ -526,8 +505,7 @@ void loadConfigFromEeprom() {
   EEPROM.get(0, config);
   bool ok = (config.magic == EEPROM_MAGIC) && (config.crc == calcConfigCrc(config));
   for (byte i = 0; i < NUM_TRAYS; ++i) {
-    if (!isfinite(config.scaleFactor[i]) || fabs(config.scaleFactor[i]) < 0.01f) ok = false;
-    if (!isfinite(config.detectGrams[i]) || config.detectGrams[i] < 1.0f) ok = false;
+    if (labs(config.scaleX10[i]) < 1 || config.detectDg[i] < 10) ok = false;
   }
   if (!ok) {
     resetDefaultConfig();
@@ -538,7 +516,7 @@ void loadConfigFromEeprom() {
 }
 
 // ==============================================================================
-// 8. HX711 로드셀 측정 및 보정 (시리얼 캘리브레이션 지원)
+// 9. HX711 로드셀 측정 및 보정
 // ==============================================================================
 bool readHX711Raw(byte ch, long &outRaw) {
   if (digitalRead(HX_DT[ch]) != LOW) return false;
@@ -559,34 +537,22 @@ bool readHX711Raw(byte ch, long &outRaw) {
   return true;
 }
 
-// 16샘플 절사평균으로 정밀 영점/평균 Raw 측정
 bool captureAverageRaw(byte ch, long &avgOut, unsigned long timeoutMs = 3000UL) {
-  long samples[16];
+  long sum = 0;
   byte count = 0;
   unsigned long start = millis();
-  while (count < 16 && (millis() - start < timeoutMs)) {
+  while (count < 12 && (millis() - start < timeoutMs)) {
     long val;
     if (readHX711Raw(ch, val)) {
       if (val != 8388607L && val != -8388608L) {
-        samples[count++] = val;
+        sum += val;
+        count++;
         delay(15);
       }
     }
   }
-  if (count < 16) return false;
-
-  for (byte i = 0; i < 15; ++i) {
-    for (byte j = i + 1; j < 16; ++j) {
-      if (samples[i] > samples[j]) {
-        long tmp = samples[i];
-        samples[i] = samples[j];
-        samples[j] = tmp;
-      }
-    }
-  }
-  int64_t sum = 0;
-  for (byte i = 2; i < 14; ++i) sum += samples[i];
-  avgOut = (long)(sum / 12);
+  if (count < 12) return false;
+  avgOut = sum / 12L;
   return true;
 }
 
@@ -598,9 +564,9 @@ bool performTare(byte ch, bool saveEeprom = false) {
     return false;
   }
   config.tareOffset[ch] = avg;
-  config.tareValid[ch]  = true;
+  config.tareValidMask |= (1 << ch);
   trays[ch].rawFiltered = avg;
-  trays[ch].weightGrams = 0.0f;
+  trays[ch].weightDg    = 0;
   trays[ch].present     = false;
   trays[ch].candidatePresent = false;
   trays[ch].health      = SENSOR_OK;
@@ -610,34 +576,31 @@ bool performTare(byte ch, bool saveEeprom = false) {
 }
 
 // ==============================================================================
-// 9. 출력 장치(공용 LED 3채널, 건조 팬) 제어 및 이벤트 트리거
+// 10. 출력 장치(공용 LED 3채널, 건조 팬) 제어 및 이벤트 트리거
 // ==============================================================================
 void startSterilization(byte spaceIdx, const char* reqId = NULL) {
   if (spaceIdx >= NUM_SPACES) return;
-  uint8_t sec = config.spaces[spaceIdx].sterilSec;
+  uint8_t sec = config.sterilSec[spaceIdx];
   if (sec != 5 && sec != 10 && sec != 20 && sec != 30) sec = 10;
 
   outputs[spaceIdx].sterilActive  = true;
   outputs[spaceIdx].sterilUntilMs = millis() + ((unsigned long)sec * 1000UL);
   if (reqId && reqId[0]) {
     strncpy(outputs[spaceIdx].activeReqId, reqId, sizeof(outputs[spaceIdx].activeReqId) - 1);
-    outputs[spaceIdx].activeReqId[15] = '\0';
+    outputs[spaceIdx].activeReqId[11] = '\0';
   } else {
     outputs[spaceIdx].activeReqId[0] = '\0';
   }
   stateDirty = true;
 }
 
-void stopSterilization(byte spaceIdx, const char* reason = NULL) {
-  if (spaceIdx >= NUM_SPACES) return;
-  if (!outputs[spaceIdx].sterilActive) return;
+void stopSterilization(byte spaceIdx, PGM_P reasonP = NULL, bool completed = false) {
+  if (spaceIdx >= NUM_SPACES || !outputs[spaceIdx].sterilActive) return;
 
   outputs[spaceIdx].sterilActive  = false;
   outputs[spaceIdx].sterilUntilMs = 0;
-  if (outputs[spaceIdx].activeReqId[0] && reason) {
-    sendAck(outputs[spaceIdx].activeReqId,
-            strcmp(reason, "duration_elapsed") == 0 ? "completed" : "stopped",
-            reason);
+  if (outputs[spaceIdx].activeReqId[0] && reasonP) {
+    sendAckP(outputs[spaceIdx].activeReqId, completed ? PSTR("completed") : PSTR("stopped"), reasonP);
   }
   outputs[spaceIdx].activeReqId[0] = '\0';
   stateDirty = true;
@@ -650,14 +613,14 @@ void startFan(uint8_t seconds, const char* reqId = NULL) {
   digitalWrite(FAN_PIN, HIGH);
   if (reqId && reqId[0]) {
     strncpy(fan.activeReqId, reqId, sizeof(fan.activeReqId) - 1);
-    fan.activeReqId[15] = '\0';
+    fan.activeReqId[11] = '\0';
   } else {
     fan.activeReqId[0] = '\0';
   }
   stateDirty = true;
 }
 
-void stopFan(const char* reason = NULL) {
+void stopFan(PGM_P reasonP = NULL, bool completed = false) {
   if (!fan.active) {
     digitalWrite(FAN_PIN, LOW);
     return;
@@ -665,21 +628,16 @@ void stopFan(const char* reason = NULL) {
   fan.active  = false;
   fan.untilMs = 0;
   digitalWrite(FAN_PIN, LOW);
-  if (fan.activeReqId[0] && reason) {
-    sendAck(fan.activeReqId,
-            strcmp(reason, "duration_elapsed") == 0 ? "completed" : "stopped",
-            reason);
+  if (fan.activeReqId[0] && reasonP) {
+    sendAckP(fan.activeReqId, completed ? PSTR("completed") : PSTR("stopped"), reasonP);
   }
   fan.activeReqId[0] = '\0';
   stateDirty = true;
 }
 
 bool isSpaceItemPresent(byte spaceIdx) {
-  if (spaceIdx < NUM_TRAYS) {
-    return (trays[spaceIdx].health == SENSOR_OK) && trays[spaceIdx].present;
-  } else if (spaceIdx == 2) {
-    return (umbrella.health == SENSOR_OK) && umbrella.present;
-  }
+  if (spaceIdx < NUM_TRAYS) return (trays[spaceIdx].health == SENSOR_OK) && trays[spaceIdx].present;
+  if (spaceIdx == 2) return (umbrella.health == SENSOR_OK) && umbrella.active;
   return false;
 }
 
@@ -689,69 +647,48 @@ bool isSpaceSensorOk(byte spaceIdx) {
   return false;
 }
 
-// 물건/우산 상태 변화 시 호출 (거치 시 일반 LED 즉시 소등 + 앱에 데이터 전송)
 void onSpaceItemChanged(byte spaceIdx, bool nowPresent) {
   if (spaceIdx >= NUM_SPACES) return;
+  uint8_t flags = config.spaceFlags[spaceIdx];
 
   if (nowPresent) {
-    // [확정 요구사항] 거치 감지 시 일반 백색 LED는 즉시 소등하고 앱으로 상태 전송
+    // 거치 감지 시 일반 LED 즉시 소등
     outputs[spaceIdx].normalActive = false;
 
-    // 거치 시 자동 살균 설정이 켜져 있으면 보라색 살균 시작
-    if (config.spaces[spaceIdx].sterilEnabled && config.spaces[spaceIdx].sterilOnDetect) {
-      if (!outputs[spaceIdx].sterilActive) {
-        startSterilization(spaceIdx, NULL);
-      }
+    if ((flags & CFG_STERIL_EN) && (flags & CFG_STERIL_DETECT) && !outputs[spaceIdx].sterilActive) {
+      startSterilization(spaceIdx, NULL);
     }
-
-    // 3번 우산 공간에 우산이 거치되었고 팬 시간이 설정되어 있으면 팬 가동
     if (spaceIdx == 2 && config.fanDurationSec > 0) {
       startFan(config.fanDurationSec, NULL);
     }
   } else {
-    // 물건/우산이 제거되면 일반 점멸 및 살균/팬 즉시 중지 (소등)
     outputs[spaceIdx].normalActive = false;
-    if (outputs[spaceIdx].sterilActive) {
-      stopSterilization(spaceIdx, "item_removed");
-    }
-    if (spaceIdx == 2 && fan.active) {
-      stopFan("item_removed");
-    }
+    if (outputs[spaceIdx].sterilActive) stopSterilization(spaceIdx, PSTR("item_removed"), false);
+    if (spaceIdx == 2 && fan.active) stopFan(PSTR("item_removed"), false);
   }
-
   stateDirty = true;
 }
 
-// 현관문 개폐 상태 변화 시 호출
 void onDoorStateChanged(bool nowOpen) {
   unsigned long now = millis();
   if (nowOpen) {
-    // 현관문이 닫힘 -> 열림으로 바뀔 때
     for (byte s = 0; s < NUM_SPACES; ++s) {
       if (isSpaceItemPresent(s)) {
-        // 1) 일반 LED(미수거 알림): ledEnabled && ledOnDoor 이면 백색 1.5초 점멸 시작
-        if (config.spaces[s].ledEnabled && config.spaces[s].ledOnDoor) {
+        uint8_t flags = config.spaceFlags[s];
+        if ((flags & CFG_LED_EN) && (flags & CFG_LED_DOOR)) {
           outputs[s].normalActive = true;
           outputs[s].normalStartedMs = now;
         }
-        // 2) 문 열림 시 자동 살균: sterilEnabled && sterilOnDoor 이면 보라색 살균 시작
-        if (config.spaces[s].sterilEnabled && config.spaces[s].sterilOnDoor) {
-          if (!outputs[s].sterilActive) {
-            startSterilization(s, NULL);
-          }
+        if ((flags & CFG_STERIL_EN) && (flags & CFG_STERIL_DOOR) && !outputs[s].sterilActive) {
+          startSterilization(s, NULL);
         }
       }
     }
-    // 점멸 시작 시 첫 페이즈를 ON으로 정렬
     blinkPhaseOn = true;
     lastBlinkToggleMs = now;
   } else {
-    // 현관문이 닫히면 문 열림 미수거 알림 점멸은 모두 즉시 소등
-    for (byte s = 0; s < NUM_SPACES; ++s) {
-      outputs[s].normalActive = false;
-    }
+    for (byte s = 0; s < NUM_SPACES; ++s) outputs[s].normalActive = false;
   }
-
   stateDirty = true;
 }
 
@@ -764,107 +701,86 @@ LedLogicalMode getLogicalLedMode(byte spaceIdx) {
 void evaluateOutputs() {
   unsigned long now = millis();
 
-  // 1) 팬 타이머 만료 확인
   if (fan.active && (int32_t)(now - fan.untilMs) >= 0) {
-    stopFan("duration_elapsed");
+    stopFan(PSTR("duration_elapsed"), true);
   }
 
-  // 2) 일반 점등 1.5초 점멸 토글 타이머
   if (now - lastBlinkToggleMs >= NORMAL_BLINK_MS) {
     lastBlinkToggleMs = now;
     blinkPhaseOn = !blinkPhaseOn;
   }
 
-  // 3) 각 공간의 살균 타이머 및 일반 점멸 유효성 확인 + 실제 WS2812B 색상 반영
   for (byte s = 0; s < NUM_SPACES; ++s) {
-    // 살균 만료 또는 센서/설정 해제 검사
+    uint8_t flags = config.spaceFlags[s];
+
     if (outputs[s].sterilActive) {
-      if (!config.spaces[s].sterilEnabled) {
-        stopSterilization(s, "disabled");
-      } else if (!isSpaceItemPresent(s)) {
-        stopSterilization(s, "item_removed");
-      } else if ((int32_t)(now - outputs[s].sterilUntilMs) >= 0) {
-        stopSterilization(s, "duration_elapsed");
-      }
+      if (!(flags & CFG_STERIL_EN)) stopSterilization(s, PSTR("disabled"), false);
+      else if (!isSpaceItemPresent(s)) stopSterilization(s, PSTR("item_removed"), false);
+      else if ((int32_t)(now - outputs[s].sterilUntilMs) >= 0) stopSterilization(s, PSTR("duration_elapsed"), true);
     }
 
-    // 일반 점멸 유효성 검사 (문 닫힘, 물건 수거, 비활성화, 최대 60초 경과 시 소등)
     if (outputs[s].normalActive) {
-      if (!config.spaces[s].ledEnabled || !config.spaces[s].ledOnDoor ||
-          !door.isOpen || !isSpaceItemPresent(s) ||
+      if (!(flags & CFG_LED_EN) || !(flags & CFG_LED_DOOR) ||
+          !door.active || !isSpaceItemPresent(s) ||
           (now - outputs[s].normalStartedMs >= NORMAL_MAX_MS)) {
         outputs[s].normalActive = false;
         stateDirty = true;
       }
     }
 
-    // 물리 RGB 색상 결정 (1순위: 보라색 살균 연속 점등, 2순위: 백색 1.5초 점멸)
-    byte targetR = 0, targetG = 0, targetB = 0;
-    if (outputs[s].sterilActive) {
-      targetR = 150; targetG = 0; targetB = 255; // 보라색 살균 점등
-    } else if (outputs[s].normalActive) {
-      if (blinkPhaseOn) {
-        targetR = 120; targetG = 120; targetB = 120; // 백색 점멸 (ON 구간)
-      } else {
-        targetR = 0; targetG = 0; targetB = 0;       // 백색 점멸 (OFF 구간)
-      }
-    }
+    // 0:OFF, 1:WHITE(120,120,120), 2:PURPLE(150,0,255)
+    byte targetCode = 0;
+    if (outputs[s].sterilActive) targetCode = 2;
+    else if (outputs[s].normalActive && blinkPhaseOn) targetCode = 1;
 
-    if (ledsNeedHardwareRefresh ||
-        outputs[s].currentR != targetR ||
-        outputs[s].currentG != targetG ||
-        outputs[s].currentB != targetB) {
-      outputs[s].currentR = targetR;
-      outputs[s].currentG = targetG;
-      outputs[s].currentB = targetB;
-      writeStripHardware(s, targetR, targetG, targetB);
+    if (ledsNeedHardwareRefresh || outputs[s].currentStateCode != targetCode) {
+      outputs[s].currentStateCode = targetCode;
+      if (targetCode == 2) writeStripHardware(s, 150, 0, 255);
+      else if (targetCode == 1) writeStripHardware(s, 120, 120, 120);
+      else writeStripHardware(s, 0, 0, 0);
     }
   }
   ledsNeedHardwareRefresh = false;
 }
 
 // ==============================================================================
-// 10. 센서 폴링 (현관문 A0, 우산 IR A3, 로드셀 CH1/CH2)
+// 11. 센서 폴링 (현관문 A0, 우산 IR A3, 로드셀 CH1/CH2)
 // ==============================================================================
 void pollSensors() {
   unsigned long now = millis();
 
-  // 1) 현관문 리드스위치 (A0) 디바운스
+  // 1) 현관문 (A0)
   byte rawDoor = digitalRead(DOOR_PIN);
   if (rawDoor != door.rawLevel) {
     door.rawLevel = rawDoor;
     door.lastDebounceMs = now;
   }
-  if (now - door.lastDebounceMs >= DEBOUNCE_MS) {
-    if (door.stableLevel != door.rawLevel) {
-      door.stableLevel = door.rawLevel;
-      bool nowOpen = (door.stableLevel != DOOR_CLOSED_LEVEL);
-      if (door.isOpen != nowOpen) {
-        door.isOpen = nowOpen;
-        onDoorStateChanged(nowOpen);
-      }
+  if (now - door.lastDebounceMs >= DEBOUNCE_MS && door.stableLevel != door.rawLevel) {
+    door.stableLevel = door.rawLevel;
+    bool nowOpen = (door.stableLevel != DOOR_CLOSED_LEVEL);
+    if (door.active != nowOpen) {
+      door.active = nowOpen;
+      onDoorStateChanged(nowOpen);
     }
   }
 
-  // 2) 3번 우산 공간 IR 센서 (A3) 디바운스
+  // 2) 우산 IR (A3)
   byte rawIr = digitalRead(IR_PIN);
   if (rawIr != umbrella.rawLevel) {
     umbrella.rawLevel = rawIr;
     umbrella.lastDebounceMs = now;
   }
-  if (now - umbrella.lastDebounceMs >= DEBOUNCE_MS) {
-    if (umbrella.stableLevel != umbrella.rawLevel) {
-      umbrella.stableLevel = umbrella.rawLevel;
-      bool nowPresent = (umbrella.stableLevel == IR_DETECTED_LEVEL);
-      umbrella.health = SENSOR_OK;
-      if (umbrella.present != nowPresent) {
-        umbrella.present = nowPresent;
-        onSpaceItemChanged(2, nowPresent);
-      }
+  if (now - umbrella.lastDebounceMs >= DEBOUNCE_MS && umbrella.stableLevel != umbrella.rawLevel) {
+    umbrella.stableLevel = umbrella.rawLevel;
+    bool nowPresent = (umbrella.stableLevel == IR_DETECTED_LEVEL);
+    umbrella.health = SENSOR_OK;
+    if (umbrella.active != nowPresent) {
+      umbrella.active = nowPresent;
+      onSpaceItemChanged(2, nowPresent);
     }
   }
 
-  // 3) 1·2번 트레이 로드셀 (HX711) 비차단 측정
+  // 3) 로드셀 1·2번 칸
   for (byte i = 0; i < NUM_TRAYS; ++i) {
     long raw;
     if (readHX711Raw(i, raw)) {
@@ -877,50 +793,40 @@ void pollSensors() {
       }
 
       trays[i].lastSampleMs = now;
-      if (!config.tareValid[i]) {
+      if (!(config.tareValidMask & (1 << i))) {
         config.tareOffset[i] = raw;
-        config.tareValid[i]  = true;
+        config.tareValidMask |= (1 << i);
         trays[i].rawFiltered = raw;
       } else {
-        // EMA 저역통과 필터 (기존 60% + 신규 40%)
         trays[i].rawFiltered = (trays[i].rawFiltered * 6L + raw * 4L) / 10L;
       }
 
       long deltaRaw = trays[i].rawFiltered - config.tareOffset[i];
-      float scale = (fabs(config.scaleFactor[i]) > 0.01f) ? config.scaleFactor[i] : 25.0f;
-      float grams = (float)deltaRaw / scale;
+      long sc10 = (labs(config.scaleX10[i]) > 0) ? config.scaleX10[i] : 250L;
+      // weightDg (0.1g 단위) = (deltaRaw * 100) / scaleX10
+      long dg = (deltaRaw * 100L) / sc10;
 
-      // 빈 트레이 상태에서 미세한 온도/크리프 드리프트 자동 영점 추종
-      if (!trays[i].present && fabs(grams) < (config.deadzoneGrams[i] * 0.8f)) {
+      if (!trays[i].present && labs(dg) < (config.deadzoneDg[i] * 8 / 10)) {
         if (deltaRaw > 3) config.tareOffset[i]++;
         else if (deltaRaw < -3) config.tareOffset[i]--;
       }
 
-      // 음수 오차 및 데드존 이내 흔들림은 0.0g으로 클램핑
-      if (grams < config.deadzoneGrams[i]) {
-        grams = 0.0f;
-      } else if (grams > 3000.0f) {
-        grams = 3000.0f;
-      }
+      if (dg < config.deadzoneDg[i]) dg = 0;
+      else if (dg > 30000L) dg = 30000L;
 
-      // 무게가 2.0g 이상 유의미하게 변했을 때도 앱에 업데이트 전송
-      if (trays[i].present && fabs(grams - trays[i].weightGrams) >= 2.0f) {
+      if (trays[i].present && labs(dg - trays[i].weightDg) >= 20) {
         stateDirty = true;
       }
-      trays[i].weightGrams = grams;
+      trays[i].weightDg = (int16_t)dg;
 
       if (trays[i].health != SENSOR_OK) {
         trays[i].health = SENSOR_OK;
         stateDirty = true;
       }
 
-      // 히스테리시스 + 250ms 안정화 필터로 물건 거치/수거 판정
       bool nextPresent = trays[i].present;
-      if (grams >= config.detectGrams[i]) {
-        nextPresent = true;
-      } else if (grams <= config.releaseGrams[i]) {
-        nextPresent = false;
-      }
+      if (dg >= config.detectDg[i]) nextPresent = true;
+      else if (dg <= config.releaseDg[i]) nextPresent = false;
 
       if (nextPresent != trays[i].candidatePresent) {
         trays[i].candidatePresent = nextPresent;
@@ -930,32 +836,29 @@ void pollSensors() {
         onSpaceItemChanged(i, nextPresent);
       }
     } else {
-      // HX711 일정 시간 무응답 시 센서 오류로 전환
-      if (now - trays[i].lastSampleMs > HX_TIMEOUT_MS) {
-        if (trays[i].health != SENSOR_ERROR) {
-          trays[i].health = SENSOR_ERROR;
-          if (outputs[i].sterilActive) stopSterilization(i, "sensor_error");
-          outputs[i].normalActive = false;
-          stateDirty = true;
-        }
+      if (now - trays[i].lastSampleMs > HX_TIMEOUT_MS && trays[i].health != SENSOR_ERROR) {
+        trays[i].health = SENSOR_ERROR;
+        if (outputs[i].sterilActive) stopSterilization(i, PSTR("sensor_error"), false);
+        outputs[i].normalActive = false;
+        stateDirty = true;
       }
     }
   }
 }
 
 // ==============================================================================
-// 11. JSON 직렬화 및 경량 파서 (동적 메모리 할당 없음)
+// 12. JSON 직렬화 및 경량 파서
 // ==============================================================================
-const char* healthToStr(SensorHealth h) {
-  if (h == SENSOR_OK) return "ok";
-  if (h == SENSOR_ERROR) return "error";
-  return "waiting";
+void printHealthStr(Stream &out, SensorHealth h) {
+  if (h == SENSOR_OK) out.print(F("ok"));
+  else if (h == SENSOR_ERROR) out.print(F("error"));
+  else out.print(F("waiting"));
 }
 
-const char* ledModeToStr(LedLogicalMode m) {
-  if (m == LED_STERIL) return "steril";
-  if (m == LED_NORMAL_BLINK) return "normal";
-  return "off";
+void printLedModeStr(Stream &out, LedLogicalMode m) {
+  if (m == LED_STERIL) out.print(F("steril"));
+  else if (m == LED_NORMAL_BLINK) out.print(F("normal"));
+  else out.print(F("off"));
 }
 
 unsigned long remainingMs(bool active, unsigned long untilMs) {
@@ -972,9 +875,9 @@ void sendStateSnapshot(Stream &out) {
   out.print(txSeq);
 
   out.print(F(",\"door\":{\"state\":\""));
-  out.print(door.isOpen ? F("open") : F("closed"));
+  out.print(door.active ? F("open") : F("closed"));
   out.print(F("\",\"sensor\":\""));
-  out.print(healthToStr(door.health));
+  printHealthStr(out, door.health);
   out.print(F("\"},\"trays\":["));
 
   for (byte i = 0; i < NUM_TRAYS; ++i) {
@@ -984,22 +887,22 @@ void sendStateSnapshot(Stream &out) {
     out.print(F(",\"present\":"));
     out.print((trays[i].health == SENSOR_OK && trays[i].present) ? F("true") : F("false"));
     out.print(F(",\"weight\":"));
-    out.print((trays[i].health == SENSOR_OK) ? trays[i].weightGrams : 0.0f, 1);
+    printDeci(out, (trays[i].health == SENSOR_OK) ? trays[i].weightDg : 0);
     out.print(F(",\"sensor\":\""));
-    out.print(healthToStr(trays[i].health));
+    printHealthStr(out, trays[i].health);
     out.print(F("\",\"led\":\""));
-    out.print(ledModeToStr(getLogicalLedMode(i)));
+    printLedModeStr(out, getLogicalLedMode(i));
     out.print(F("\",\"steril_ms\":"));
     out.print(remainingMs(outputs[i].sterilActive, outputs[i].sterilUntilMs));
     out.print('}');
   }
 
   out.print(F("],\"umbrella\":{\"present\":"));
-  out.print((umbrella.health == SENSOR_OK && umbrella.present) ? F("true") : F("false"));
+  out.print((umbrella.health == SENSOR_OK && umbrella.active) ? F("true") : F("false"));
   out.print(F(",\"sensor\":\""));
-  out.print(healthToStr(umbrella.health));
+  printHealthStr(out, umbrella.health);
   out.print(F("\",\"led\":\""));
-  out.print(ledModeToStr(getLogicalLedMode(2)));
+  printLedModeStr(out, getLogicalLedMode(2));
   out.print(F("\",\"steril_ms\":"));
   out.print(remainingMs(outputs[2].sterilActive, outputs[2].sterilUntilMs));
 
@@ -1010,76 +913,77 @@ void sendStateSnapshot(Stream &out) {
   out.println(F("}}"));
 }
 
-void sendAck(const char* reqId, const char* status, const char* reason) {
+void sendAckP(const char* reqId, PGM_P statusP, PGM_P reasonP) {
   bluetooth.print(F("{\"type\":\"ack\",\"req\":\""));
-  bluetooth.print((reqId && reqId[0]) ? reqId : "none");
+  if (reqId && reqId[0]) bluetooth.print(reqId);
+  else bluetooth.print(F("none"));
   bluetooth.print(F("\",\"status\":\""));
-  bluetooth.print(status);
+  bluetooth.print((const __FlashStringHelper*)statusP);
   bluetooth.print('"');
-  if (reason && reason[0]) {
+  if (reasonP) {
     bluetooth.print(F(",\"reason\":\""));
-    bluetooth.print(reason);
+    bluetooth.print((const __FlashStringHelper*)reasonP);
     bluetooth.print('"');
   }
   bluetooth.println('}');
 }
 
-// JSON 문자열 내에서 특정 키("key":)의 값 시작 포인터 탐색
-const char* findJsonValue(const char* json, const char* key) {
-  char pattern[24];
-  snprintf(pattern, sizeof(pattern), "\"%s\"", key);
-  const char* p = strstr(json, pattern);
-  if (!p) return NULL;
-  p += strlen(pattern);
-  while (*p == ' ' || *p == '\t') ++p;
-  if (*p != ':') return NULL;
-  ++p;
-  while (*p == ' ' || *p == '\t') ++p;
-  return p;
+// snprintf 없이 PROGMEM 키를 직접 매칭하여 Flash/SRAM 절약
+const char* findJsonValueP(const char* json, PGM_P keyP) {
+  size_t keyLen = strlen_P(keyP);
+  const char* p = json;
+  while ((p = strchr(p, '"')) != NULL) {
+    ++p;
+    if (strncmp_P(p, keyP, keyLen) == 0 && p[keyLen] == '"') {
+      p += keyLen + 1;
+      while (*p == ' ' || *p == '\t') ++p;
+      if (*p == ':') {
+        ++p;
+        while (*p == ' ' || *p == '\t') ++p;
+        return p;
+      }
+    }
+  }
+  return NULL;
 }
 
-bool extractJsonString(const char* json, const char* key, char* outBuf, size_t maxLen) {
-  const char* p = findJsonValue(json, key);
+bool extractJsonStringP(const char* json, PGM_P keyP, char* outBuf, size_t maxLen) {
+  const char* p = findJsonValueP(json, keyP);
   if (!p || *p != '"') return false;
   ++p;
   size_t i = 0;
-  while (*p && *p != '"' && i + 1 < maxLen) {
-    outBuf[i++] = *p++;
-  }
+  while (*p && *p != '"' && i + 1 < maxLen) outBuf[i++] = *p++;
   outBuf[i] = '\0';
   return (*p == '"');
 }
 
-bool extractJsonInt(const char* json, const char* key, long &outVal) {
-  const char* p = findJsonValue(json, key);
+bool extractJsonIntP(const char* json, PGM_P keyP, long &outVal) {
+  const char* p = findJsonValueP(json, keyP);
   if (!p) return false;
   char* endPtr;
   outVal = strtol(p, &endPtr, 10);
   return (endPtr != p);
 }
 
-bool extractJsonBool(const char* json, const char* key, bool &outVal) {
-  const char* p = findJsonValue(json, key);
+bool extractJsonBoolP(const char* json, PGM_P keyP, bool &outVal) {
+  const char* p = findJsonValueP(json, keyP);
   if (!p) return false;
-  if (strncmp(p, "true", 4) == 0 || *p == '1') { outVal = true; return true; }
-  if (strncmp(p, "false", 5) == 0 || *p == '0') { outVal = false; return true; }
+  if (strncmp_P(p, PSTR("true"), 4) == 0 || *p == '1') { outVal = true; return true; }
+  if (strncmp_P(p, PSTR("false"), 5) == 0 || *p == '0') { outVal = false; return true; }
   return false;
 }
 
-// "windows":["14:00-18:00","20:00-22:00"] 배열 추출
-uint8_t extractJsonStringArray(const char* json, const char* key, char outArr[3][14]) {
-  const char* p = findJsonValue(json, key);
+uint8_t extractJsonWindows(const char* json, char outArr[2][14]) {
+  const char* p = findJsonValueP(json, PSTR("windows"));
   if (!p || *p != '[') return 0;
   ++p;
   uint8_t count = 0;
-  while (*p && *p != ']' && count < 3) {
+  while (*p && *p != ']' && count < 2) {
     while (*p && *p != '"' && *p != ']') ++p;
     if (*p != '"') break;
     ++p;
     size_t i = 0;
-    while (*p && *p != '"' && i < 13) {
-      outArr[count][i++] = *p++;
-    }
+    while (*p && *p != '"' && i < 13) outArr[count][i++] = *p++;
     outArr[count][i] = '\0';
     while (*p && *p != '"' && *p != ']') ++p;
     if (*p == '"') ++p;
@@ -1088,340 +992,235 @@ uint8_t extractJsonStringArray(const char* json, const char* key, char outArr[3]
   return count;
 }
 
+void setFlagBit(uint8_t &flags, uint8_t mask, bool on) {
+  if (on) flags |= mask;
+  else flags &= ~mask;
+}
+
 void handleJsonMessage(const char* line, Stream &replyStream) {
-  char type[16] = {0};
-  char reqId[16] = {0};
-  if (!extractJsonString(line, "type", type, sizeof(type))) {
-    sendAck("none", "rejected", "invalid_json");
+  char type[14] = {0};
+  char reqId[12] = {0};
+  if (!extractJsonStringP(line, PSTR("type"), type, sizeof(type))) {
+    sendAckP(NULL, PSTR("rejected"), PSTR("invalid_json"));
     return;
   }
-  extractJsonString(line, "req", reqId, sizeof(reqId));
-  if (!reqId[0]) extractJsonString(line, "request_id", reqId, sizeof(reqId));
+  if (!extractJsonStringP(line, PSTR("req"), reqId, sizeof(reqId))) {
+    extractJsonStringP(line, PSTR("request_id"), reqId, sizeof(reqId));
+  }
 
-  // 1) 즉시 상태 조회: {"type":"get_state","req":"..."}
-  if (strcmp(type, "get_state") == 0) {
-    if (reqId[0]) sendAck(reqId, "accepted");
+  // 1) get_state
+  if (strcmp_P(type, PSTR("get_state")) == 0) {
+    if (reqId[0]) sendAckP(reqId, PSTR("accepted"));
     sendStateSnapshot(replyStream);
     lastStateSentMs = millis();
     stateDirty = false;
     return;
   }
 
-  // 2) 공간별 설정 동기화: {"type":"set_config","req":"...","space":1,...}
-  if (strcmp(type, "set_config") == 0) {
+  // 2) set_config
+  if (strcmp_P(type, PSTR("set_config")) == 0) {
     long space = 0;
-    if (!extractJsonInt(line, "space", space)) {
-      extractJsonInt(line, "space_id", space);
-    }
+    if (!extractJsonIntP(line, PSTR("space"), space)) extractJsonIntP(line, PSTR("space_id"), space);
     if (space < 1 || space > 3) {
-      sendAck(reqId, "rejected", "invalid_space");
+      sendAckP(reqId, PSTR("rejected"), PSTR("invalid_space"));
       return;
     }
     byte idx = (byte)(space - 1);
-    SpaceConfig &sc = config.spaces[idx];
+    uint8_t &flags = config.spaceFlags[idx];
 
     bool bVal;
     long iVal;
-    if (extractJsonBool(line, "led_en", bVal)) sc.ledEnabled = bVal;
-    if (extractJsonBool(line, "led_door", bVal)) sc.ledOnDoor = bVal;
-    if (extractJsonBool(line, "steril_en", bVal) || extractJsonBool(line, "enabled", bVal)) sc.sterilEnabled = bVal;
-    if (extractJsonBool(line, "steril_detect", bVal) || extractJsonBool(line, "on_detect", bVal)) sc.sterilOnDetect = bVal;
-    if (extractJsonBool(line, "steril_door", bVal) || extractJsonBool(line, "on_door", bVal)) sc.sterilOnDoor = bVal;
+    if (extractJsonBoolP(line, PSTR("led_en"), bVal)) setFlagBit(flags, CFG_LED_EN, bVal);
+    if (extractJsonBoolP(line, PSTR("led_door"), bVal)) setFlagBit(flags, CFG_LED_DOOR, bVal);
+    if (extractJsonBoolP(line, PSTR("steril_en"), bVal) || extractJsonBoolP(line, PSTR("enabled"), bVal))
+      setFlagBit(flags, CFG_STERIL_EN, bVal);
+    if (extractJsonBoolP(line, PSTR("steril_detect"), bVal) || extractJsonBoolP(line, PSTR("on_detect"), bVal))
+      setFlagBit(flags, CFG_STERIL_DETECT, bVal);
+    if (extractJsonBoolP(line, PSTR("steril_door"), bVal) || extractJsonBoolP(line, PSTR("on_door"), bVal))
+      setFlagBit(flags, CFG_STERIL_DOOR, bVal);
 
-    if (extractJsonInt(line, "steril_sec", iVal) || extractJsonInt(line, "duration_s", iVal)) {
+    if (extractJsonIntP(line, PSTR("steril_sec"), iVal) || extractJsonIntP(line, PSTR("duration_s"), iVal)) {
       if (iVal == 5 || iVal == 10 || iVal == 20 || iVal == 30) {
-        sc.sterilSec = (uint8_t)iVal;
+        config.sterilSec[idx] = (uint8_t)iVal;
       } else {
-        sc.sterilSec = 10;
-        sc.sterilEnabled = false;
+        config.sterilSec[idx] = 10;
+        setFlagBit(flags, CFG_STERIL_EN, false);
       }
     }
 
-    if (idx == 2 && (extractJsonInt(line, "fan_sec", iVal))) {
+    if (idx == 2 && extractJsonIntP(line, PSTR("fan_sec"), iVal)) {
       if (iVal == 0 || iVal == 15 || iVal == 30 || iVal == 60) {
         config.fanDurationSec = (uint8_t)iVal;
-        if (config.fanDurationSec == 0 && fan.active) {
-          stopFan("disabled");
-        }
+        if (iVal == 0 && fan.active) stopFan(PSTR("disabled"), false);
       }
     }
 
-    if (!sc.sterilEnabled && outputs[idx].sterilActive) {
-      stopSterilization(idx, "disabled");
-    }
-    if (!sc.ledEnabled && outputs[idx].normalActive) {
-      outputs[idx].normalActive = false;
-    }
+    if (!(flags & CFG_STERIL_EN) && outputs[idx].sterilActive) stopSterilization(idx, PSTR("disabled"), false);
+    if (!(flags & CFG_LED_EN)) outputs[idx].normalActive = false;
 
     saveConfigToEeprom();
-    sendAck(reqId, "accepted");
+    sendAckP(reqId, PSTR("accepted"));
     stateDirty = true;
     return;
   }
 
-  // 3) 수동 제어 명령: {"type":"cmd","req":"...","space":1,"action":"start_steril"}
-  if (strcmp(type, "cmd") == 0 || strcmp(type, "command") == 0) {
-    char action[24] = {0};
+  // 3) cmd
+  if (strcmp_P(type, PSTR("cmd")) == 0 || strcmp_P(type, PSTR("command")) == 0) {
+    char action[22] = {0};
     long space = 0;
-    extractJsonString(line, "action", action, sizeof(action));
-    if (!extractJsonInt(line, "space", space)) extractJsonInt(line, "space_id", space);
+    extractJsonStringP(line, PSTR("action"), action, sizeof(action));
+    if (!extractJsonIntP(line, PSTR("space"), space)) extractJsonIntP(line, PSTR("space_id"), space);
 
-    if (strcmp(action, "start_steril") == 0 || strcmp(action, "start_sterilization") == 0) {
-      if (space < 1 || space > 3) { sendAck(reqId, "rejected", "invalid_space"); return; }
+    if (strcmp_P(action, PSTR("start_steril")) == 0 || strcmp_P(action, PSTR("start_sterilization")) == 0) {
+      if (space < 1 || space > 3) { sendAckP(reqId, PSTR("rejected"), PSTR("invalid_space")); return; }
       byte idx = (byte)(space - 1);
-      if (!config.spaces[idx].sterilEnabled) { sendAck(reqId, "rejected", "steril_disabled"); return; }
-      if (!isSpaceSensorOk(idx)) { sendAck(reqId, "rejected", "sensor_error"); return; }
-      if (!isSpaceItemPresent(idx)) { sendAck(reqId, "rejected", "no_item"); return; }
-      if (outputs[idx].sterilActive) { sendAck(reqId, "rejected", "already_running"); return; }
+      if (!(config.spaceFlags[idx] & CFG_STERIL_EN)) { sendAckP(reqId, PSTR("rejected"), PSTR("steril_disabled")); return; }
+      if (!isSpaceSensorOk(idx)) { sendAckP(reqId, PSTR("rejected"), PSTR("sensor_error")); return; }
+      if (!isSpaceItemPresent(idx)) { sendAckP(reqId, PSTR("rejected"), PSTR("no_item")); return; }
+      if (outputs[idx].sterilActive) { sendAckP(reqId, PSTR("rejected"), PSTR("already_running")); return; }
 
-      sendAck(reqId, "accepted");
+      sendAckP(reqId, PSTR("accepted"));
       startSterilization(idx, reqId);
       return;
     }
-    if (strcmp(action, "stop_steril") == 0 || strcmp(action, "stop_sterilization") == 0) {
-      if (space < 1 || space > 3) { sendAck(reqId, "rejected", "invalid_space"); return; }
-      sendAck(reqId, "accepted");
-      stopSterilization((byte)(space - 1), "manual_stop");
+    if (strcmp_P(action, PSTR("stop_steril")) == 0 || strcmp_P(action, PSTR("stop_sterilization")) == 0) {
+      if (space < 1 || space > 3) { sendAckP(reqId, PSTR("rejected"), PSTR("invalid_space")); return; }
+      sendAckP(reqId, PSTR("accepted"));
+      stopSterilization((byte)(space - 1), PSTR("manual_stop"), false);
       return;
     }
-    if (strcmp(action, "start_fan") == 0) {
+    if (strcmp_P(action, PSTR("start_fan")) == 0) {
       long sec = config.fanDurationSec;
-      extractJsonInt(line, "sec", sec);
+      extractJsonIntP(line, PSTR("sec"), sec);
       if (sec != 15 && sec != 30 && sec != 60) sec = (config.fanDurationSec > 0) ? config.fanDurationSec : 30;
-      if (!isSpaceSensorOk(2)) { sendAck(reqId, "rejected", "sensor_error"); return; }
-      if (!isSpaceItemPresent(2)) { sendAck(reqId, "rejected", "no_item"); return; }
+      if (!isSpaceSensorOk(2)) { sendAckP(reqId, PSTR("rejected"), PSTR("sensor_error")); return; }
+      if (!isSpaceItemPresent(2)) { sendAckP(reqId, PSTR("rejected"), PSTR("no_item")); return; }
 
-      sendAck(reqId, "accepted");
+      sendAckP(reqId, PSTR("accepted"));
       startFan((uint8_t)sec, reqId);
       return;
     }
-    if (strcmp(action, "stop_fan") == 0) {
-      sendAck(reqId, "accepted");
-      stopFan("manual_stop");
+    if (strcmp_P(action, PSTR("stop_fan")) == 0) {
+      sendAckP(reqId, PSTR("accepted"));
+      stopFan(PSTR("manual_stop"), false);
       return;
     }
-    if (strcmp(action, "tare") == 0) {
-      if (space < 1 || space > 2) { sendAck(reqId, "rejected", "invalid_space"); return; }
+    if (strcmp_P(action, PSTR("tare")) == 0) {
+      if (space < 1 || space > 2) { sendAckP(reqId, PSTR("rejected"), PSTR("invalid_space")); return; }
       if (performTare((byte)(space - 1), true)) {
-        sendAck(reqId, "accepted");
+        sendAckP(reqId, PSTR("accepted"));
         stateDirty = true;
       } else {
-        sendAck(reqId, "rejected", "sensor_error");
+        sendAckP(reqId, PSTR("rejected"), PSTR("sensor_error"));
       }
       return;
     }
-
-    sendAck(reqId, "rejected", "unknown_action");
+    sendAckP(reqId, PSTR("rejected"), PSTR("unknown_action"));
     return;
   }
 
-  // 4) 1602 LCD 날씨 업데이트: {"type":"weather","req":"...","valid":true,"icon":"rain","line1":"RAIN","windows":["14:00-18:00"],"ttl_s":3600}
-  if (strcmp(type, "weather") == 0) {
+  // 4) weather
+  if (strcmp_P(type, PSTR("weather")) == 0) {
     weatherLcd.receivedOnce = true;
     bool valid = true;
-    if (!extractJsonBool(line, "valid", valid)) {
-      char statusStr[12] = {0};
-      if (extractJsonString(line, "status", statusStr, sizeof(statusStr))) {
-        valid = (strcmp(statusStr, "valid") == 0 || strcmp(statusStr, "ready") == 0);
-      }
-    }
-
+    extractJsonBoolP(line, PSTR("valid"), valid);
     if (!valid) {
       setWeatherNoData();
-      sendAck(reqId, "accepted");
+      sendAckP(reqId, PSTR("accepted"));
       refreshLcdWeather(true);
       return;
     }
 
-    char iconStr[16] = {0};
-    if (!extractJsonString(line, "icon", iconStr, sizeof(iconStr))) {
-      extractJsonString(line, "display_condition", iconStr, sizeof(iconStr));
+    char iconStr[14] = {0};
+    if (!extractJsonStringP(line, PSTR("icon"), iconStr, sizeof(iconStr))) {
+      extractJsonStringP(line, PSTR("display_condition"), iconStr, sizeof(iconStr));
     }
 
-    if (strcmp(iconStr, "rain") == 0 || strcmp(iconStr, "shower") == 0 || strcmp(iconStr, "rain-snow") == 0) {
-      weatherLcd.icon = W_ICON_RAIN;
-      strncpy(weatherLcd.line1, "RAIN", sizeof(weatherLcd.line1) - 1);
-    } else if (strcmp(iconStr, "snow") == 0) {
-      weatherLcd.icon = W_ICON_SNOW;
-      strncpy(weatherLcd.line1, "SNOW", sizeof(weatherLcd.line1) - 1);
-    } else if (strcmp(iconStr, "cloudy") == 0 || strcmp(iconStr, "partly-cloudy") == 0) {
-      weatherLcd.icon = W_ICON_CLOUDY;
-      strncpy(weatherLcd.line1, "CLOUDY", sizeof(weatherLcd.line1) - 1);
-    } else if (strcmp(iconStr, "sunny") == 0 || strcmp(iconStr, "clear") == 0) {
-      weatherLcd.icon = W_ICON_SUNNY;
-      strncpy(weatherLcd.line1, "SUNNY", sizeof(weatherLcd.line1) - 1);
+    if (strcmp_P(iconStr, PSTR("rain")) == 0 || strcmp_P(iconStr, PSTR("shower")) == 0 || strcmp_P(iconStr, PSTR("rain-snow")) == 0) {
+      setWeatherPreset(W_ICON_RAIN, PSTR("RAIN"), PSTR("14:00-18:00"), true);
+    } else if (strcmp_P(iconStr, PSTR("snow")) == 0) {
+      setWeatherPreset(W_ICON_SNOW, PSTR("SNOW"), PSTR("NO RAIN"), true);
+    } else if (strcmp_P(iconStr, PSTR("cloudy")) == 0 || strcmp_P(iconStr, PSTR("partly-cloudy")) == 0) {
+      setWeatherPreset(W_ICON_CLOUDY, PSTR("CLOUDY"), PSTR("NO RAIN/SNOW"), true);
+    } else if (strcmp_P(iconStr, PSTR("sunny")) == 0 || strcmp_P(iconStr, PSTR("clear")) == 0) {
+      setWeatherPreset(W_ICON_SUNNY, PSTR("SUNNY"), PSTR("NO RAIN/SNOW"), true);
     } else {
       setWeatherNoData();
-      sendAck(reqId, "accepted");
+      sendAckP(reqId, PSTR("accepted"));
       refreshLcdWeather(true);
       return;
     }
 
     char customLine1[14] = {0};
-    if (extractJsonString(line, "line1", customLine1, sizeof(customLine1)) && customLine1[0]) {
-      strncpy(weatherLcd.line1, customLine1, sizeof(weatherLcd.line1) - 1);
+    if (extractJsonStringP(line, PSTR("line1"), customLine1, sizeof(customLine1)) && customLine1[0]) {
+      strncpy(weatherLcd.line1, customLine1, 13);
       weatherLcd.line1[13] = '\0';
     }
 
-    uint8_t winCnt = extractJsonStringArray(line, "windows", weatherLcd.windows);
-    if (winCnt == 0) {
-      char line2Str[14] = {0};
-      if (extractJsonString(line, "line2", line2Str, sizeof(line2Str)) && line2Str[0]) {
-        strncpy(weatherLcd.windows[0], line2Str, 13);
-        weatherLcd.windows[0][13] = '\0';
-        winCnt = 1;
-      } else {
-        bool hasRain = false, hasSnow = false;
-        extractJsonBool(line, "has_rain_forecast", hasRain);
-        extractJsonBool(line, "has_snow_forecast", hasSnow);
-        if (weatherLcd.icon == W_ICON_SNOW || hasSnow) {
-          strncpy(weatherLcd.windows[0], "NO RAIN", 13);
-        } else {
-          strncpy(weatherLcd.windows[0], "NO RAIN/SNOW", 13);
-        }
-        winCnt = 1;
-      }
-    }
+    uint8_t winCnt = extractJsonWindows(line, weatherLcd.windows);
+    if (winCnt > 0) weatherLcd.windowCount = winCnt;
 
     long ttlSec = 3600;
-    extractJsonInt(line, "ttl_s", ttlSec);
-    weatherLcd.valid = true;
-    weatherLcd.windowCount = winCnt;
-    weatherLcd.currentWindowIdx = 0;
-    weatherLcd.lastWindowCycleMs = millis();
+    extractJsonIntP(line, PSTR("ttl_s"), ttlSec);
     weatherLcd.receivedAtMs = millis();
     weatherLcd.ttlMs = (ttlSec > 0) ? ((unsigned long)ttlSec * 1000UL) : 0UL;
     weatherLcd.dirty = true;
 
-    sendAck(reqId, "accepted");
+    sendAckP(reqId, PSTR("accepted"));
     refreshLcdWeather(true);
     return;
   }
 
-  sendAck(reqId, "rejected", "unknown_type");
+  sendAckP(reqId, PSTR("rejected"), PSTR("unknown_type"));
 }
 
 // ==============================================================================
-// 12. 시리얼 캘리브레이션, 하드웨어 수동 제어 및 시뮬레이션 콘솔 (USB Serial 115200bps)
+// 13. 시리얼 캘리브레이션 & 수동 테스트 콘솔 (PROGMEM 최적화)
 // ==============================================================================
-bool liveMonitorEnabled = false;
-unsigned long lastMonitorPrintMs = 0;
-
 void printCalibrationHelp() {
-  Serial.println(F("\n================== [ 아마따 시리얼 통합 진단 & 수동 테스트 안내 ] =================="));
-  Serial.println(F(" [1. 상태 조회 및 실시간 모니터]"));
-  Serial.println(F("  STATUS                 : 현재 전체 JSON 상태 스냅샷 1회 출력"));
-  Serial.println(F("  MON  (또는 M)          : 실시간 센서/출력 텔레메트리 모니터 ON/OFF 토글 (500ms 주기)"));
-  Serial.println(F("  SENSOR (또는 D)        : 현관문(A0), 우산 IR(A3), 로드셀(CH1/2), 설정 상태 상세 리포트"));
-  Serial.println(F(" [2. 로드셀 캘리브레이션 및 EEPROM]"));
-  Serial.println(F("  CAL SHOW               : 1·2번 로드셀 현재 보정값(Tare/Scale/임계값) 조회"));
-  Serial.println(F("  TARE [1|2]             : 빈 상태에서 영점(0.0g) 기준 측정 (생략 시 1·2번 모두 영점)"));
-  Serial.println(F("  CAL <1|2> <무게g>      : 트레이에 기준 분동을 올린 후 Scale Factor 자동 계산 (예: CAL 1 200)"));
-  Serial.println(F("  SCALE <1|2> <값>       : Scale Factor 수동 입력 (예: SCALE 1 25.4)"));
-  Serial.println(F("  TH <1|2> <감지g> <해제g>: 물건 감지/해제 문턱값 설정 (예: TH 1 15.0 8.0)"));
-  Serial.println(F("  DZ <1|2> <데드존g>     : 진동 제거 데드존 설정 (예: DZ 1 3.0)"));
-  Serial.println(F("  SAVE / RESET           : 현재 설정을 EEPROM에 영구 저장 / 공장 초기화"));
-  Serial.println(F(" [3. 공유 LED (WS2812B 3채널) & 살균 수동 테스트]"));
-  Serial.println(F("  LED <1|2|3|ALL> STERIL [초] : 해당 칸 보라색 살균 점등 수동 시작 (기본 10초, 예: LED 1 STERIL 10)"));
-  Serial.println(F("  LED <1|2|3|ALL> BLINK      : 해당 칸 백색 1.5초 주기 일반 점멸 강제 시작"));
-  Serial.println(F("  LED <1|2|3|ALL> OFF        : 해당 칸 LED/살균 즉시 소등"));
-  Serial.println(F(" [4. 우산 건조 팬 (D11) 수동 테스트]"));
-  Serial.println(F("  FAN ON [초]            : 팬 수동 가동 (시간 생략 시 30초, 예: FAN ON 15)"));
-  Serial.println(F("  FAN OFF                : 팬 즉시 정지"));
-  Serial.println(F(" [5. 1602 LCD 날씨 화면 수동 프리셋 테스트]"));
-  Serial.println(F("  LCD WAIT               : 'WAITING... / WEATHER INFO' (기상 정보 대기중 아이콘)"));
-  Serial.println(F("  LCD SUNNY              : 'SUNNY / NO RAIN/SNOW' (해 아이콘)"));
-  Serial.println(F("  LCD CLOUDY             : 'CLOUDY / NO RAIN/SNOW' (구름 아이콘)"));
-  Serial.println(F("  LCD RAIN [시간대1] [2] : 'RAIN / 14:00-18:00' (비 아이콘 + 다중 시간대 순환 테스트)"));
-  Serial.println(F("  LCD SNOW               : 'SNOW / NO RAIN' (눈 아이콘)"));
-  Serial.println(F("  LCD NODATA             : 'NO DATA' (수신 실패/만료 아이콘)"));
-  Serial.println(F(" [6. 이벤트 시뮬레이션 & 블루투스 송신 테스트]"));
-  Serial.println(F("  SIM DOOR <OPEN|CLOSE>  : 현관문 열림/닫힘 이벤트 강제 트리거 (LED 점멸 및 앱 전송 확인)"));
-  Serial.println(F("  SIM ITEM <1|2|3> <1|0> : 1·2번 트레이 또는 3번 우산 거치(1)/수거(0) 이벤트 강제 트리거"));
-  Serial.println(F("  BT SEND                : 현재 state JSON 패킷을 블루투스(HC-06)로 즉시 강제 전송"));
-  Serial.println(F("====================================================================================\n"));
+  Serial.println(F("\n=== [ AMATTA SERIAL TEST & CALIBRATION ] ==="));
+  Serial.println(F(" STATUS | MON (M) | SENSOR (D) | BT SEND"));
+  Serial.println(F(" CAL SHOW | TARE [1|2] | CAL <1|2> <g>"));
+  Serial.println(F(" SCALE <1|2> <val> | TH <1|2> <det> <rel> | DZ <1|2> <g>"));
+  Serial.println(F(" SAVE | RESET"));
+  Serial.println(F(" LED <1|2|3|ALL> <STERIL|BLINK|OFF> [sec]"));
+  Serial.println(F(" FAN ON [sec] | FAN OFF"));
+  Serial.println(F(" LCD <WAIT|SUNNY|CLOUDY|RAIN|SNOW|NODATA> [w1] [w2]"));
+  Serial.println(F(" SIM DOOR <OPEN|CLOSE> | SIM ITEM <1|2|3> <1|0>"));
+  Serial.println(F("============================================"));
 }
 
 void printCalibrationStatus() {
-  Serial.println(F("\n--- [ 로드셀 캘리브레이션 상태 ] ---"));
   for (byte i = 0; i < NUM_TRAYS; ++i) {
-    Serial.print(F("Tray #")); Serial.print(i + 1);
-    Serial.print(F(" | Health: ")); Serial.print(healthToStr(trays[i].health));
-    Serial.print(F(" | Raw: ")); Serial.print(trays[i].rawFiltered);
-    Serial.print(F(" | Tare: ")); Serial.print(config.tareOffset[i]);
-    Serial.print(F(" | Scale: ")); Serial.print(config.scaleFactor[i], 2);
-    Serial.print(F(" | Weight: ")); Serial.print(trays[i].weightGrams, 1); Serial.print(F("g"));
-    Serial.print(F(" | Present: ")); Serial.print(trays[i].present ? F("YES") : F("NO"));
-    Serial.print(F(" (TH:")); Serial.print(config.detectGrams[i], 1);
-    Serial.print(F("g / REL:")); Serial.print(config.releaseGrams[i], 1);
-    Serial.print(F("g / DZ:")); Serial.print(config.deadzoneGrams[i], 1); Serial.println(F("g)"));
+    Serial.print(F("T#")); Serial.print(i + 1);
+    Serial.print(F(" Raw:")); Serial.print(trays[i].rawFiltered);
+    Serial.print(F(" Tare:")); Serial.print(config.tareOffset[i]);
+    Serial.print(F(" Sc:")); printDeci(Serial, config.scaleX10[i]);
+    Serial.print(F(" W:")); printDeci(Serial, trays[i].weightDg);
+    Serial.print(F("g P:")); Serial.print(trays[i].present);
+    Serial.print(F(" TH:")); printDeci(Serial, config.detectDg[i]);
+    Serial.print('/'); printDeci(Serial, config.releaseDg[i]);
+    Serial.print(F(" DZ:")); printDeci(Serial, config.deadzoneDg[i]);
+    Serial.println();
   }
-  Serial.println(F("------------------------------------\n"));
-}
-
-void printSensorAndOutputDetail() {
-  Serial.println(F("\n================ [ 하드웨어 센서 & 출력 실시간 상세 상태 ] ================"));
-  Serial.print(F(" [현관문 A0] 물리 핀: "));
-  Serial.print(door.stableLevel == DOOR_CLOSED_LEVEL ? F("LOW(자석 밀착) -> ") : F("HIGH(자석 분리) -> "));
-  Serial.println(door.isOpen ? F("【 OPEN (열림) 】") : F("【 CLOSED (닫힘) 】"));
-
-  Serial.print(F(" [우산 IR A3] 물리 핀: "));
-  Serial.print(umbrella.stableLevel == IR_DETECTED_LEVEL ? F("LOW(감지) -> ") : F("HIGH(미감지) -> "));
-  Serial.println(umbrella.present ? F("【 PRESENT (우산 있음) 】") : F("【 EMPTY (우산 없음) 】"));
-
-  Serial.print(F(" [건조 팬 D11] 상태: "));
-  Serial.print(fan.active ? F("【 ON (5V 출력 중) 】 남은시간: ") : F("【 OFF (0V) 】 남은시간: "));
-  Serial.print(remainingMs(fan.active, fan.untilMs) / 1000UL);
-  Serial.print(F("s (설정 fan_sec=")); Serial.print(config.fanDurationSec); Serial.println(F("s)"));
-
-  for (byte s = 0; s < NUM_SPACES; ++s) {
-    Serial.print(F(" [공간 #")); Serial.print(s + 1); Serial.print(F("] LED 모드: "));
-    Serial.print(ledModeToStr(getLogicalLedMode(s)));
-    Serial.print(F(" | 살균 남은시간: "));
-    Serial.print(remainingMs(outputs[s].sterilActive, outputs[s].sterilUntilMs) / 1000UL);
-    Serial.print(F("s | 설정(led_en=")); Serial.print(config.spaces[s].ledEnabled);
-    Serial.print(F(", led_door=")); Serial.print(config.spaces[s].ledOnDoor);
-    Serial.print(F(", steril_en=")); Serial.print(config.spaces[s].sterilEnabled);
-    Serial.print(F(", detect=")); Serial.print(config.spaces[s].sterilOnDetect);
-    Serial.print(F(", door=")); Serial.print(config.spaces[s].sterilOnDoor);
-    Serial.print(F(", sec=")); Serial.print(config.spaces[s].sterilSec);
-    Serial.println(F("s)"));
-  }
-  printCalibrationStatus();
 }
 
 void printLiveMonitorLine() {
-  Serial.print(F("[MON] 문:"));
-  Serial.print(door.isOpen ? F("열림") : F("닫힘"));
+  Serial.print(F("[MON] D:")); Serial.print(door.active ? F("OPN") : F("CLS"));
   for (byte i = 0; i < NUM_TRAYS; ++i) {
-    Serial.print(F(" | T")); Serial.print(i + 1); Serial.print(':');
-    if (trays[i].health != SENSOR_OK) {
-      Serial.print(F("ERR"));
-    } else {
-      Serial.print(trays[i].weightGrams, 1); Serial.print(F("g("));
-      Serial.print(trays[i].present ? F("O") : F("X")); Serial.print(')');
-    }
-    Serial.print(F("[LED:")); Serial.print(ledModeToStr(getLogicalLedMode(i))); Serial.print(']');
+    Serial.print(F(" T")); Serial.print(i + 1); Serial.print(':');
+    printDeci(Serial, trays[i].weightDg);
+    Serial.print(F("g(")); Serial.print(trays[i].present); Serial.print(')');
   }
-  Serial.print(F(" | 우산:"));
-  Serial.print(umbrella.present ? F("O") : F("X"));
-  Serial.print(F("[LED:")); Serial.print(ledModeToStr(getLogicalLedMode(2))); Serial.print(']');
-  Serial.print(F(" | 팬:"));
-  Serial.print(fan.active ? F("ON(") : F("OFF("));
-  Serial.print(remainingMs(fan.active, fan.untilMs) / 1000UL);
-  Serial.println(F("s)"));
-}
-
-void toUpperStr(char* s) {
-  if (!s) return;
-  for (; *s; ++s) if (*s >= 'a' && *s <= 'z') *s -= 32;
+  Serial.print(F(" U:")); Serial.print(umbrella.active);
+  Serial.print(F(" F:")); Serial.print(fan.active);
+  Serial.println();
 }
 
 void handleSerialCommand(char* line) {
   while (*line == ' ' || *line == '\t') ++line;
   if (*line == '\0') return;
 
-  // JSON 형식이면 블루투스와 동일하게 JSON 파서로 처리 (시리얼 테스트 용도)
   if (*line == '{') {
     handleJsonMessage(line, Serial);
     return;
@@ -1431,314 +1230,208 @@ void handleSerialCommand(char* line) {
   if (!cmd) return;
   toUpperStr(cmd);
 
-  if (strcmp(cmd, "HELP") == 0 || strcmp(cmd, "H") == 0 || strcmp(cmd, "?") == 0) {
+  if (strcmp_P(cmd, PSTR("HELP")) == 0 || strcmp_P(cmd, PSTR("H")) == 0 || strcmp_P(cmd, PSTR("?")) == 0) {
     printCalibrationHelp();
   }
-  else if (strcmp(cmd, "STATUS") == 0) {
+  else if (strcmp_P(cmd, PSTR("STATUS")) == 0) {
     sendStateSnapshot(Serial);
   }
-  else if (strcmp(cmd, "MON") == 0 || strcmp(cmd, "M") == 0) {
+  else if (strcmp_P(cmd, PSTR("MON")) == 0 || strcmp_P(cmd, PSTR("M")) == 0) {
     liveMonitorEnabled = !liveMonitorEnabled;
     lastMonitorPrintMs = millis();
-    Serial.print(F(">>> [MON] 실시간 텔레메트리 모니터: "));
-    Serial.println(liveMonitorEnabled ? F("ON (500ms 주기 출력, 중지하려면 다시 M 입력)") : F("OFF"));
+    Serial.print(F(">> MON=")); Serial.println(liveMonitorEnabled);
   }
-  else if (strcmp(cmd, "SENSOR") == 0 || strcmp(cmd, "D") == 0 || strcmp(cmd, "DOOR") == 0) {
-    printSensorAndOutputDetail();
+  else if (strcmp_P(cmd, PSTR("SENSOR")) == 0 || strcmp_P(cmd, PSTR("D")) == 0) {
+    printLiveMonitorLine();
+    printCalibrationStatus();
   }
-  else if (strcmp(cmd, "TARE") == 0) {
-    char* arg1 = strtok(NULL, " \t");
-    if (!arg1) {
-      for (byte i = 0; i < NUM_TRAYS; ++i) performTare(i, false);
-      Serial.println(F(">>> [TARE] 1·2번 트레이 모두 영점 보정 완료 (영구 저장은 SAVE 입력)"));
+  else if (strcmp_P(cmd, PSTR("TARE")) == 0) {
+    char* a1 = strtok(NULL, " \t");
+    if (!a1) {
+      performTare(0, false);
+      performTare(1, false);
+      Serial.println(F(">> TARE ALL OK"));
     } else {
-      int ch = atoi(arg1) - 1;
-      if (ch >= 0 && ch < NUM_TRAYS && performTare((byte)ch, false)) {
-        Serial.print(F(">>> [TARE] ")); Serial.print(ch + 1);
-        Serial.print(F("번 트레이 영점 완료 (Tare Raw = "));
-        Serial.print(config.tareOffset[ch]); Serial.println(F(")"));
-      } else {
-        Serial.println(F(">>> [ERR] TARE 실패 (트레이 번호 1~2 또는 센서 연결 확인)"));
-      }
+      int ch = atoi(a1) - 1;
+      if (ch >= 0 && ch < NUM_TRAYS && performTare((byte)ch, false)) Serial.println(F(">> TARE OK"));
+      else Serial.println(F(">> TARE ERR"));
     }
     stateDirty = true;
   }
-  else if (strcmp(cmd, "CAL") == 0) {
-    char* arg1 = strtok(NULL, " \t");
-    if (!arg1 || strcasecmp(arg1, "SHOW") == 0) {
+  else if (strcmp_P(cmd, PSTR("CAL")) == 0) {
+    char* a1 = strtok(NULL, " \t");
+    if (!a1 || strcmp_P(a1, PSTR("SHOW")) == 0 || strcmp_P(a1, PSTR("show")) == 0) {
       printCalibrationStatus();
       return;
     }
-    int ch = atoi(arg1) - 1;
-    char* arg2 = strtok(NULL, " \t");
-    float knownGrams = arg2 ? atof(arg2) : 0.0f;
-    if (ch < 0 || ch >= NUM_TRAYS || knownGrams < 5.0f) {
-      Serial.println(F(">>> [사용법] CAL <트레이 1|2> <기준무게g> (예: CAL 1 200)"));
+    int ch = atoi(a1) - 1;
+    long knownDg = parseDeci(strtok(NULL, " \t"));
+    if (ch < 0 || ch >= NUM_TRAYS || knownDg < 50) {
+      Serial.println(F(">> USE: CAL <1|2> <g>"));
       return;
     }
     long avgRaw;
-    Serial.println(F(">>> [CAL] 정밀 샘플링 중... 물건을 움직이지 마세요."));
-    if (!captureAverageRaw((byte)ch, avgRaw)) {
-      Serial.println(F(">>> [ERR] 로드셀 샘플링 실패"));
-      return;
-    }
+    if (!captureAverageRaw((byte)ch, avgRaw)) { Serial.println(F(">> SAMPLE ERR")); return; }
     long delta = avgRaw - config.tareOffset[ch];
-    if (labs(delta) < 50) {
-      Serial.println(F(">>> [ERR] 변화량이 너무 작습니다. 먼저 빈 상태에서 TARE를 수행하세요."));
-      return;
-    }
-    config.scaleFactor[ch] = (float)delta / knownGrams;
-    Serial.print(F(">>> [CAL 완료] Tray #")); Serial.print(ch + 1);
-    Serial.print(F(" 새 Scale Factor = ")); Serial.print(config.scaleFactor[ch], 2);
-    Serial.println(F(" (SAVE 명령으로 EEPROM에 저장하세요)"));
+    if (labs(delta) < 50) { Serial.println(F(">> DELTA TOO SMALL")); return; }
+    config.scaleX10[ch] = (delta * 100L) / knownDg;
+    Serial.print(F(">> CAL OK Sc=")); printDeci(Serial, config.scaleX10[ch]); Serial.println();
     stateDirty = true;
   }
-  else if (strcmp(cmd, "SCALE") == 0) {
-    char* arg1 = strtok(NULL, " \t");
-    char* arg2 = strtok(NULL, " \t");
-    int ch = arg1 ? (atoi(arg1) - 1) : -1;
-    float sc = arg2 ? atof(arg2) : 0.0f;
-    if (ch >= 0 && ch < NUM_TRAYS && fabs(sc) > 0.01f) {
-      config.scaleFactor[ch] = sc;
-      Serial.print(F(">>> [SCALE] Tray #")); Serial.print(ch + 1);
-      Serial.print(F(" Scale = ")); Serial.println(sc, 2);
+  else if (strcmp_P(cmd, PSTR("SCALE")) == 0) {
+    int ch = atoi(strtok(NULL, " \t")) - 1;
+    long sc10 = parseDeci(strtok(NULL, " \t"));
+    if (ch >= 0 && ch < NUM_TRAYS && labs(sc10) > 0) {
+      config.scaleX10[ch] = sc10;
+      Serial.println(F(">> SCALE OK"));
     }
   }
-  else if (strcmp(cmd, "TH") == 0) {
-    char* arg1 = strtok(NULL, " \t");
-    char* arg2 = strtok(NULL, " \t");
-    char* arg3 = strtok(NULL, " \t");
-    int ch = arg1 ? (atoi(arg1) - 1) : -1;
-    float det = arg2 ? atof(arg2) : 0.0f;
-    float rel = arg3 ? atof(arg3) : (det * 0.55f);
-    if (ch >= 0 && ch < NUM_TRAYS && det >= 2.0f) {
-      config.detectGrams[ch]  = det;
-      config.releaseGrams[ch] = rel;
-      Serial.print(F(">>> [TH] Tray #")); Serial.print(ch + 1);
-      Serial.print(F(" 감지=")); Serial.print(det, 1);
-      Serial.print(F("g / 해제=")); Serial.print(rel, 1); Serial.println(F("g"));
+  else if (strcmp_P(cmd, PSTR("TH")) == 0) {
+    int ch = atoi(strtok(NULL, " \t")) - 1;
+    long det = parseDeci(strtok(NULL, " \t"));
+    long rel = parseDeci(strtok(NULL, " \t"));
+    if (ch >= 0 && ch < NUM_TRAYS && det >= 20) {
+      config.detectDg[ch]  = (int16_t)det;
+      config.releaseDg[ch] = (int16_t)((rel > 0) ? rel : (det / 2));
+      Serial.println(F(">> TH OK"));
     }
   }
-  else if (strcmp(cmd, "DZ") == 0) {
-    char* arg1 = strtok(NULL, " \t");
-    char* arg2 = strtok(NULL, " \t");
-    int ch = arg1 ? (atoi(arg1) - 1) : -1;
-    float dz = arg2 ? atof(arg2) : -1.0f;
-    if (ch >= 0 && ch < NUM_TRAYS && dz >= 0.0f && dz <= 30.0f) {
-      config.deadzoneGrams[ch] = dz;
-      Serial.print(F(">>> [DZ] Tray #")); Serial.print(ch + 1);
-      Serial.print(F(" 데드존=")); Serial.print(dz, 1); Serial.println(F("g"));
+  else if (strcmp_P(cmd, PSTR("DZ")) == 0) {
+    int ch = atoi(strtok(NULL, " \t")) - 1;
+    long dz = parseDeci(strtok(NULL, " \t"));
+    if (ch >= 0 && ch < NUM_TRAYS && dz >= 0 && dz <= 300) {
+      config.deadzoneDg[ch] = (int16_t)dz;
+      Serial.println(F(">> DZ OK"));
     }
   }
-  else if (strcmp(cmd, "LED") == 0) {
+  else if (strcmp_P(cmd, PSTR("LED")) == 0) {
     char* targetStr = strtok(NULL, " \t");
     char* modeStr   = strtok(NULL, " \t");
     char* secStr    = strtok(NULL, " \t");
-    if (!targetStr || !modeStr) {
-      Serial.println(F(">>> [사용법] LED <1|2|3|ALL> <STERIL|BLINK|OFF> [초]"));
-      return;
-    }
+    if (!targetStr || !modeStr) return;
     toUpperStr(targetStr);
     toUpperStr(modeStr);
-    byte startIdx = 0, endIdx = NUM_SPACES - 1;
-    if (strcmp(targetStr, "ALL") != 0) {
+    byte s0 = 0, s1 = NUM_SPACES - 1;
+    if (strcmp_P(targetStr, PSTR("ALL")) != 0) {
       int sp = atoi(targetStr);
-      if (sp < 1 || sp > 3) {
-        Serial.println(F(">>> [ERR] 공간 번호는 1, 2, 3 또는 ALL 이어야 합니다."));
-        return;
-      }
-      startIdx = endIdx = (byte)(sp - 1);
+      if (sp < 1 || sp > 3) return;
+      s0 = s1 = (byte)(sp - 1);
     }
-    int customSec = secStr ? atoi(secStr) : 10;
-    if (customSec < 1 || customSec > 300) customSec = 10;
+    int sec = secStr ? atoi(secStr) : 10;
+    if (sec < 1 || sec > 300) sec = 10;
 
-    for (byte s = startIdx; s <= endIdx; ++s) {
-      if (strcmp(modeStr, "STERIL") == 0 || strcmp(modeStr, "PURPLE") == 0) {
-        config.spaces[s].sterilEnabled = true;
+    for (byte s = s0; s <= s1; ++s) {
+      if (strcmp_P(modeStr, PSTR("STERIL")) == 0) {
+        config.spaceFlags[s] |= CFG_STERIL_EN;
         outputs[s].sterilActive = true;
-        outputs[s].sterilUntilMs = millis() + ((unsigned long)customSec * 1000UL);
+        outputs[s].sterilUntilMs = millis() + ((unsigned long)sec * 1000UL);
         outputs[s].activeReqId[0] = '\0';
-      } else if (strcmp(modeStr, "BLINK") == 0 || strcmp(modeStr, "NORMAL") == 0 || strcmp(modeStr, "WHITE") == 0) {
-        config.spaces[s].ledEnabled = true;
-        config.spaces[s].ledOnDoor  = true;
+      } else if (strcmp_P(modeStr, PSTR("BLINK")) == 0) {
+        config.spaceFlags[s] |= (CFG_LED_EN | CFG_LED_DOOR);
         outputs[s].sterilActive = false;
         outputs[s].normalActive = true;
         outputs[s].normalStartedMs = millis();
         blinkPhaseOn = true;
         lastBlinkToggleMs = millis();
-      } else if (strcmp(modeStr, "OFF") == 0 || strcmp(modeStr, "0") == 0) {
+      } else {
         outputs[s].sterilActive = false;
         outputs[s].normalActive = false;
-        outputs[s].sterilUntilMs = 0;
       }
     }
     ledsNeedHardwareRefresh = true;
     stateDirty = true;
-    Serial.print(F(">>> [LED 수동 제어] 대상=")); Serial.print(targetStr);
-    Serial.print(F(", 모드=")); Serial.println(modeStr);
+    Serial.println(F(">> LED OK"));
   }
-  else if (strcmp(cmd, "FAN") == 0) {
+  else if (strcmp_P(cmd, PSTR("FAN")) == 0) {
     char* sub = strtok(NULL, " \t");
     char* secStr = strtok(NULL, " \t");
-    if (!sub) {
-      Serial.println(F(">>> [사용법] FAN ON [초]  또는  FAN OFF"));
-      return;
-    }
+    if (!sub) return;
     toUpperStr(sub);
-    if (strcmp(sub, "ON") == 0 || strcmp(sub, "1") == 0) {
+    if (strcmp_P(sub, PSTR("ON")) == 0 || strcmp_P(sub, PSTR("1")) == 0) {
       int sec = secStr ? atoi(secStr) : 30;
-      if (sec < 1 || sec > 300) sec = 30;
-      startFan((uint8_t)sec, NULL);
-      Serial.print(F(">>> [FAN 수동 제어] D11 팬 가동 시작 (")); Serial.print(sec); Serial.println(F("초)"));
-    } else if (strcmp(sub, "OFF") == 0 || strcmp(sub, "0") == 0 || strcmp(sub, "STOP") == 0) {
-      stopFan("manual_stop");
-      Serial.println(F(">>> [FAN 수동 제어] D11 팬 즉시 정지"));
+      startFan((uint8_t)((sec > 0 && sec <= 240) ? sec : 30), NULL);
+      Serial.println(F(">> FAN ON"));
     } else {
-      int sec = atoi(sub);
-      if (sec > 0 && sec <= 300) {
-        startFan((uint8_t)sec, NULL);
-        Serial.print(F(">>> [FAN 수동 제어] D11 팬 가동 시작 (")); Serial.print(sec); Serial.println(F("초)"));
-      }
+      stopFan(PSTR("manual_stop"), false);
+      Serial.println(F(">> FAN OFF"));
     }
   }
-  else if (strcmp(cmd, "LCD") == 0) {
+  else if (strcmp_P(cmd, PSTR("LCD")) == 0) {
     char* sub = strtok(NULL, " \t");
-    if (!sub) sub = (char*)"WAIT";
+    if (!sub) return;
     toUpperStr(sub);
-
-    if (strcmp(sub, "WAIT") == 0) {
-      initWeatherDisplayWait();
-      refreshLcdWeather(true);
-      Serial.println(F(">>> [LCD 테스트] 'WAITING... / WEATHER INFO' (기상 정보 대기중) 표시"));
-    } else if (strcmp(sub, "NODATA") == 0 || strcmp(sub, "NONE") == 0) {
-      weatherLcd.receivedOnce = true;
-      setWeatherNoData();
-      refreshLcdWeather(true);
-      Serial.println(F(">>> [LCD 테스트] 'NO DATA' 화면 표시"));
-    } else if (strcmp(sub, "SUNNY") == 0 || strcmp(sub, "CLEAR") == 0) {
-      weatherLcd.receivedOnce = true;
-      weatherLcd.valid = true;
-      weatherLcd.icon = W_ICON_SUNNY;
-      strcpy(weatherLcd.line1, "SUNNY");
-      strcpy(weatherLcd.windows[0], "NO RAIN/SNOW");
-      weatherLcd.windowCount = 1;
-      weatherLcd.currentWindowIdx = 0;
-      weatherLcd.ttlMs = 0;
-      weatherLcd.dirty = true;
-      refreshLcdWeather(true);
-      Serial.println(F(">>> [LCD 테스트] 'SUNNY / NO RAIN/SNOW' (해 아이콘) 표시"));
-    } else if (strcmp(sub, "CLOUDY") == 0) {
-      weatherLcd.receivedOnce = true;
-      weatherLcd.valid = true;
-      weatherLcd.icon = W_ICON_CLOUDY;
-      strcpy(weatherLcd.line1, "CLOUDY");
-      strcpy(weatherLcd.windows[0], "NO RAIN/SNOW");
-      weatherLcd.windowCount = 1;
-      weatherLcd.currentWindowIdx = 0;
-      weatherLcd.ttlMs = 0;
-      weatherLcd.dirty = true;
-      refreshLcdWeather(true);
-      Serial.println(F(">>> [LCD 테스트] 'CLOUDY / NO RAIN/SNOW' (구름 아이콘) 표시"));
-    } else if (strcmp(sub, "SNOW") == 0) {
-      weatherLcd.receivedOnce = true;
-      weatherLcd.valid = true;
-      weatherLcd.icon = W_ICON_SNOW;
-      strcpy(weatherLcd.line1, "SNOW");
-      strcpy(weatherLcd.windows[0], "NO RAIN");
-      weatherLcd.windowCount = 1;
-      weatherLcd.currentWindowIdx = 0;
-      weatherLcd.ttlMs = 0;
-      weatherLcd.dirty = true;
-      refreshLcdWeather(true);
-      Serial.println(F(">>> [LCD 테스트] 'SNOW / NO RAIN' (눈 아이콘) 표시"));
-    } else if (strcmp(sub, "RAIN") == 0) {
-      weatherLcd.receivedOnce = true;
-      weatherLcd.valid = true;
-      weatherLcd.icon = W_ICON_RAIN;
-      strcpy(weatherLcd.line1, "RAIN");
+    weatherLcd.receivedOnce = true;
+    if (strcmp_P(sub, PSTR("WAIT")) == 0) initWeatherDisplayWait();
+    else if (strcmp_P(sub, PSTR("SUNNY")) == 0) setWeatherPreset(W_ICON_SUNNY, PSTR("SUNNY"), PSTR("NO RAIN/SNOW"), true);
+    else if (strcmp_P(sub, PSTR("CLOUDY")) == 0) setWeatherPreset(W_ICON_CLOUDY, PSTR("CLOUDY"), PSTR("NO RAIN/SNOW"), true);
+    else if (strcmp_P(sub, PSTR("SNOW")) == 0) setWeatherPreset(W_ICON_SNOW, PSTR("SNOW"), PSTR("NO RAIN"), true);
+    else if (strcmp_P(sub, PSTR("RAIN")) == 0) {
+      setWeatherPreset(W_ICON_RAIN, PSTR("RAIN"), PSTR("14:00-18:00"), true);
       char* w1 = strtok(NULL, " \t");
       char* w2 = strtok(NULL, " \t");
-      if (!w1) {
-        strcpy(weatherLcd.windows[0], "14:00-18:00");
-        weatherLcd.windowCount = 1;
-      } else {
-        strncpy(weatherLcd.windows[0], w1, 13);
-        weatherLcd.windows[0][13] = '\0';
-        weatherLcd.windowCount = 1;
+      if (w1) {
+        strncpy(weatherLcd.windows[0], w1, 13); weatherLcd.windows[0][13] = '\0';
         if (w2) {
-          strncpy(weatherLcd.windows[1], w2, 13);
-          weatherLcd.windows[1][13] = '\0';
+          strncpy(weatherLcd.windows[1], w2, 13); weatherLcd.windows[1][13] = '\0';
           weatherLcd.windowCount = 2;
         }
       }
-      weatherLcd.currentWindowIdx = 0;
-      weatherLcd.lastWindowCycleMs = millis();
-      weatherLcd.ttlMs = 0;
-      weatherLcd.dirty = true;
-      refreshLcdWeather(true);
-      Serial.println(F(">>> [LCD 테스트] 'RAIN' (비 아이콘 + 비 예보 시간대) 표시"));
-    }
+    } else setWeatherNoData();
+    refreshLcdWeather(true);
+    Serial.println(F(">> LCD OK"));
   }
-  else if (strcmp(cmd, "SIM") == 0) {
+  else if (strcmp_P(cmd, PSTR("SIM")) == 0) {
     char* target = strtok(NULL, " \t");
-    char* arg1   = strtok(NULL, " \t");
-    char* arg2   = strtok(NULL, " \t");
-    if (!target || !arg1) {
-      Serial.println(F(">>> [사용법] SIM DOOR <OPEN|CLOSE>  또는  SIM ITEM <1|2|3> <1|0>"));
-      return;
-    }
+    char* a1     = strtok(NULL, " \t");
+    char* a2     = strtok(NULL, " \t");
+    if (!target || !a1) return;
     toUpperStr(target);
-    toUpperStr(arg1);
-    if (strcmp(target, "DOOR") == 0) {
-      bool openSim = (strcmp(arg1, "OPEN") == 0 || strcmp(arg1, "1") == 0);
-      door.isOpen = openSim;
-      onDoorStateChanged(openSim);
-      Serial.print(F(">>> [SIM] 현관문 상태 강제 전환 -> "));
-      Serial.println(openSim ? F("OPEN (열림)") : F("CLOSED (닫힘)"));
-    } else if (strcmp(target, "ITEM") == 0 && arg2) {
-      int sp = atoi(arg1);
-      bool pres = (atoi(arg2) != 0);
+    toUpperStr(a1);
+    if (strcmp_P(target, PSTR("DOOR")) == 0) {
+      bool opn = (strcmp_P(a1, PSTR("OPEN")) == 0 || *a1 == '1');
+      door.active = opn;
+      onDoorStateChanged(opn);
+      Serial.println(F(">> SIM DOOR OK"));
+    } else if (strcmp_P(target, PSTR("ITEM")) == 0 && a2) {
+      int sp = atoi(a1);
+      bool pres = (*a2 != '0');
       if (sp == 1 || sp == 2) {
         trays[sp - 1].health = SENSOR_OK;
         trays[sp - 1].present = pres;
         trays[sp - 1].candidatePresent = pres;
-        trays[sp - 1].weightGrams = pres ? 120.0f : 0.0f;
+        trays[sp - 1].weightDg = pres ? 1200 : 0;
         onSpaceItemChanged((byte)(sp - 1), pres);
-        Serial.print(F(">>> [SIM] 트레이 #")); Serial.print(sp);
-        Serial.println(pres ? F(" 물건 거치(present=true) 이벤트 발생") : F(" 물건 수거(present=false) 이벤트 발생"));
       } else if (sp == 3) {
         umbrella.health = SENSOR_OK;
-        umbrella.present = pres;
+        umbrella.active = pres;
         onSpaceItemChanged(2, pres);
-        Serial.println(pres ? F(">>> [SIM] 우산 공간 거치(present=true) 이벤트 발생") : F(">>> [SIM] 우산 공간 수거(present=false) 이벤트 발생"));
       }
+      Serial.println(F(">> SIM ITEM OK"));
     }
   }
-  else if (strcmp(cmd, "BT") == 0) {
+  else if (strcmp_P(cmd, PSTR("BT")) == 0) {
     sendStateSnapshot(bluetooth);
     sendStateSnapshot(Serial);
-    Serial.println(F(">>> [BT SEND] 현재 상태 스냅샷을 HC-06 블루투스로 즉시 전송했습니다."));
   }
-  else if (strcmp(cmd, "SAVE") == 0) {
+  else if (strcmp_P(cmd, PSTR("SAVE")) == 0) {
     saveConfigToEeprom();
-    Serial.println(F(">>> [SAVE] 보정값 및 설정이 EEPROM에 저장되었습니다."));
+    Serial.println(F(">> SAVED"));
   }
-  else if (strcmp(cmd, "RESET") == 0) {
+  else if (strcmp_P(cmd, PSTR("RESET")) == 0) {
     resetDefaultConfig();
-    Serial.println(F(">>> [RESET] EEPROM 설정이 초기값으로 리셋되었습니다."));
+    Serial.println(F(">> RESET OK"));
   }
   else {
-    Serial.println(F(">>> 알 수 없는 명령어입니다. 'HELP'를 입력하세요."));
+    Serial.println(F(">> UNKNOWN CMD (TYPE 'HELP')"));
   }
 }
 
 // ==============================================================================
-// 13. 비차단 스트림 수신 루프
+// 14. 비차단 스트림 수신 루프
 // ==============================================================================
 void pollStreams() {
   unsigned long now = millis();
 
-  // 1) HC-06 블루투스 수신
   while (bluetooth.available()) {
     char c = (char)bluetooth.read();
     lastBtRxMs = now;
@@ -1748,16 +1441,13 @@ void pollStreams() {
         btRxBuf[btRxLen] = '\0';
         handleJsonMessage(btRxBuf, bluetooth);
       } else if (btRxOverflow) {
-        sendAck("none", "rejected", "frame_too_long");
+        sendAckP(NULL, PSTR("rejected"), PSTR("frame_too_long"));
       }
       btRxLen = 0;
       btRxOverflow = false;
     } else {
-      if (btRxLen + 1 < sizeof(btRxBuf)) {
-        btRxBuf[btRxLen++] = c;
-      } else {
-        btRxOverflow = true;
-      }
+      if (btRxLen + 1 < sizeof(btRxBuf)) btRxBuf[btRxLen++] = c;
+      else btRxOverflow = true;
     }
   }
   if (btRxLen > 0 && (now - lastBtRxMs > 1500UL)) {
@@ -1765,7 +1455,6 @@ void pollStreams() {
     btRxOverflow = false;
   }
 
-  // 2) USB 시리얼 수신 (캘리브레이션 및 디버그용)
   while (Serial.available()) {
     char c = (char)Serial.read();
     lastSerialRxMs = now;
@@ -1788,13 +1477,12 @@ void pollStreams() {
 }
 
 // ==============================================================================
-// 14. 초기 설정 (setup) 및 메인 루프 (loop)
+// 15. 초기 설정 (setup) 및 메인 루프 (loop)
 // ==============================================================================
 void setup() {
   Serial.begin(115200);
   bluetooth.begin(9600);
 
-  // 1) 출력 핀 초기화
   pinMode(FAN_PIN, OUTPUT);
   digitalWrite(FAN_PIN, LOW);
 
@@ -1804,69 +1492,47 @@ void setup() {
     writeStripHardware(s, 0, 0, 0);
   }
 
-  // 2) 센서 핀 초기화 (현관문 A0, 우산 IR A3)
   pinMode(DOOR_PIN, INPUT_PULLUP);
   pinMode(IR_PIN, INPUT_PULLUP);
 
-  // 3) EEPROM 설정 및 보정값 로드
   loadConfigFromEeprom();
 
-  // 4) 현관문 및 우산 IR 초기 상태 설정
   unsigned long now = millis();
   door.rawLevel = door.stableLevel = digitalRead(DOOR_PIN);
   door.lastDebounceMs = now;
-  door.isOpen = (door.stableLevel != DOOR_CLOSED_LEVEL);
+  door.active = (door.stableLevel != DOOR_CLOSED_LEVEL);
   door.health = SENSOR_OK;
 
   umbrella.rawLevel = umbrella.stableLevel = digitalRead(IR_PIN);
   umbrella.lastDebounceMs = now;
-  umbrella.present = (umbrella.stableLevel == IR_DETECTED_LEVEL);
+  umbrella.active = (umbrella.stableLevel == IR_DETECTED_LEVEL);
   umbrella.health = SENSOR_OK;
 
-  // 5) 로드셀 핀 초기화 및 부팅 시 초기 영점(Baseline) 확인
   for (byte i = 0; i < NUM_TRAYS; ++i) {
     pinMode(HX_DT[i], INPUT);
     pinMode(HX_CLOCK[i], OUTPUT);
     digitalWrite(HX_CLOCK[i], LOW);
     trays[i].health = SENSOR_WAITING;
-    trays[i].present = false;
-    trays[i].candidatePresent = false;
-    trays[i].weightGrams = 0.0f;
     trays[i].lastSampleMs = now;
-
-    // 부팅 시 센서가 연결되어 있으면 초기 영점 측정
     performTare(i, false);
   }
 
-  // 6) 1602 I2C LCD 초기화 -> "기상 정보 대기중" 화면 출력
   Wire.begin();
   Wire.setWireTimeout(3000, true);
   lcdAvailable = initI2CLcd();
   initWeatherDisplayWait();
   refreshLcdWeather(true);
 
-  Serial.println(F("\n======================================================="));
-  Serial.println(F(" 아마따 (AMATTA) 스마트 트레이 펌웨어 v1.0 준비 완료"));
-  Serial.println(F(" - 캘리브레이션 도움말: 시리얼 모니터에 'HELP' 입력"));
-  Serial.println(F("======================================================="));
-
+  Serial.println(F("AMATTA READY (Type HELP)"));
   stateDirty = true;
 }
 
 void loop() {
-  // 1) 블루투스(HC-06) 및 USB 시리얼 명령 수신 처리
   pollStreams();
-
-  // 2) 현관문(A0), 우산 IR(A3), 로드셀(CH1/CH2) 상태 측정 및 변화 감지
   pollSensors();
-
-  // 3) 공유 LED(보라색 살균 / 백색 1.5초 점멸) 및 건조 팬 타이머 갱신
   evaluateOutputs();
-
-  // 4) 1602 LCD 날씨 화면 갱신 및 비 예보 구간 순환
   refreshLcdWeather(false);
 
-  // 5) 내부 상태가 변경되었거나(stateDirty) 1초 주기가 도래하면 즉시 앱으로 전송
   unsigned long now = millis();
   if (stateDirty || (now - lastStateSentMs >= STATE_HEARTBEAT_MS)) {
     stateDirty = false;
@@ -1874,7 +1540,6 @@ void loop() {
     sendStateSnapshot(bluetooth);
   }
 
-  // 6) 실시간 시리얼 텔레메트리 모니터 (MON 토글 ON 시 500ms 주기 출력)
   if (liveMonitorEnabled && (now - lastMonitorPrintMs >= 500UL)) {
     lastMonitorPrintMs = now;
     printLiveMonitorLine();
