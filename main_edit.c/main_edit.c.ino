@@ -537,23 +537,30 @@ bool readHX711Raw(byte ch, long &outRaw) {
   return true;
 }
 
-bool captureAverageRaw(byte ch, long &avgOut, unsigned long timeoutMs = 3000UL) {
+bool captureAverageRaw(byte ch, long &avgOut, unsigned long timeoutMs = 1500UL) {
   long sum = 0;
   byte count = 0;
   unsigned long start = millis();
-  while (count < 12 && (millis() - start < timeoutMs)) {
+  while (count < 6 && (millis() - start < timeoutMs)) {
     long val;
     if (readHX711Raw(ch, val)) {
-      if (val != 8388607L && val != -8388608L) {
+      if (val != 8388607L && val != -8388608L && val != 0L && val != -1L) {
         sum += val;
         count++;
-        delay(15);
+        delay(12);
       }
     }
   }
-  if (count < 12) return false;
-  avgOut = sum / 12L;
-  return true;
+  if (count > 0) {
+    avgOut = sum / (long)count;
+    return true;
+  }
+  // 실시간 루프에서 이미 정상 수신 중이었다면 직전 필터값 활용
+  if (trays[ch].health == SENSOR_OK && trays[ch].rawFiltered != 0) {
+    avgOut = trays[ch].rawFiltered;
+    return true;
+  }
+  return false;
 }
 
 bool performTare(byte ch, bool saveEeprom = false) {
@@ -867,18 +874,39 @@ unsigned long remainingMs(bool active, unsigned long untilMs) {
   return (diff > 0) ? (unsigned long)diff : 0UL;
 }
 
+bool serialLineReady = false;
+
+void pumpSerialRx() {
+  unsigned long now = millis();
+  while (Serial.available() && !serialLineReady) {
+    char c = (char)Serial.read();
+    lastSerialRxMs = now;
+    if (c == '\r') continue;
+    if (c == '\n') {
+      if (serialRxLen > 0) {
+        serialRxBuf[serialRxLen] = '\0';
+        serialLineReady = true;
+      }
+    } else if (c >= 32 && c <= 126 && serialRxLen + 1 < sizeof(serialRxBuf)) {
+      serialRxBuf[serialRxLen++] = c;
+    }
+  }
+}
+
 void sendStateSnapshot(Stream &out) {
   ++txSeq;
   out.print(F("{\"type\":\"state\",\"v\":1,\"boot\":"));
   out.print(config.bootCount);
   out.print(F(",\"seq\":"));
   out.print(txSeq);
+  pumpSerialRx();
 
   out.print(F(",\"door\":{\"state\":\""));
   out.print(door.active ? F("open") : F("closed"));
   out.print(F("\",\"sensor\":\""));
   printHealthStr(out, door.health);
   out.print(F("\"},\"trays\":["));
+  pumpSerialRx();
 
   for (byte i = 0; i < NUM_TRAYS; ++i) {
     if (i > 0) out.print(',');
@@ -895,6 +923,7 @@ void sendStateSnapshot(Stream &out) {
     out.print(F("\",\"steril_ms\":"));
     out.print(remainingMs(outputs[i].sterilActive, outputs[i].sterilUntilMs));
     out.print('}');
+    pumpSerialRx();
   }
 
   out.print(F("],\"umbrella\":{\"present\":"));
@@ -905,12 +934,14 @@ void sendStateSnapshot(Stream &out) {
   printLedModeStr(out, getLogicalLedMode(2));
   out.print(F("\",\"steril_ms\":"));
   out.print(remainingMs(outputs[2].sterilActive, outputs[2].sterilUntilMs));
+  pumpSerialRx();
 
   out.print(F("},\"fan\":{\"active\":"));
   out.print(fan.active ? F("true") : F("false"));
   out.print(F(",\"rem_ms\":"));
   out.print(remainingMs(fan.active, fan.untilMs));
   out.println(F("}}"));
+  pumpSerialRx();
 }
 
 void sendAckP(const char* reqId, PGM_P statusP, PGM_P reasonP) {
@@ -1245,16 +1276,36 @@ void handleSerialCommand(char* line) {
     printLiveMonitorLine();
     printCalibrationStatus();
   }
-  else if (strcmp_P(cmd, PSTR("TARE")) == 0) {
+  else if (strcmp_P(cmd, PSTR("TARE")) == 0 || strcmp_P(cmd, PSTR("T")) == 0 ||
+           strcmp_P(cmd, PSTR("TARE1")) == 0 || strcmp_P(cmd, PSTR("TARE2")) == 0 ||
+           strcmp_P(cmd, PSTR("T1")) == 0 || strcmp_P(cmd, PSTR("T2")) == 0) {
     char* a1 = strtok(NULL, " \t");
-    if (!a1) {
-      performTare(0, false);
-      performTare(1, false);
-      Serial.println(F(">> TARE ALL OK"));
-    } else {
-      int ch = atoi(a1) - 1;
-      if (ch >= 0 && ch < NUM_TRAYS && performTare((byte)ch, false)) Serial.println(F(">> TARE OK"));
-      else Serial.println(F(">> TARE ERR"));
+    int targetCh = -1; // -1이면 전체 채널(1, 2) 영점 수행
+    size_t cmdLen = strlen(cmd);
+    if (cmd[cmdLen - 1] == '1') targetCh = 0;
+    else if (cmd[cmdLen - 1] == '2') targetCh = 1;
+    else if (a1) {
+      for (const char* p = a1; *p; ++p) {
+        if (*p == '1') { targetCh = 0; break; }
+        if (*p == '2') { targetCh = 1; break; }
+      }
+      if (targetCh < 0 && (strcmp_P(a1, PSTR("ALL")) != 0 && strcmp_P(a1, PSTR("all")) != 0)) {
+        Serial.println(F(">> USE: TARE [1|2]"));
+        return;
+      }
+    }
+
+    byte c0 = (targetCh < 0) ? 0 : (byte)targetCh;
+    byte c1 = (targetCh < 0) ? (NUM_TRAYS - 1) : (byte)targetCh;
+    for (byte ch = c0; ch <= c1; ++ch) {
+      if (performTare(ch, false)) {
+        Serial.print(F(">> TARE CH")); Serial.print(ch + 1);
+        Serial.print(F(" OK Base=")); Serial.println(config.tareOffset[ch]);
+      } else {
+        Serial.print(F(">> TARE CH")); Serial.print(ch + 1);
+        Serial.print(F(" ERR: HX711 NO SIGNAL (DT=D")); Serial.print(HX_DT[ch]);
+        Serial.print(F(" LVL=")); Serial.print(digitalRead(HX_DT[ch])); Serial.println(')');
+      }
     }
     stateDirty = true;
   }
@@ -1422,7 +1473,9 @@ void handleSerialCommand(char* line) {
     Serial.println(F(">> RESET OK"));
   }
   else {
-    Serial.println(F(">> UNKNOWN CMD (TYPE 'HELP')"));
+    Serial.print(F(">> UNKNOWN CMD: '"));
+    Serial.print(cmd);
+    Serial.println(F("' (TYPE 'HELP')"));
   }
 }
 
@@ -1455,24 +1508,12 @@ void pollStreams() {
     btRxOverflow = false;
   }
 
-  while (Serial.available()) {
-    char c = (char)Serial.read();
-    lastSerialRxMs = now;
-    if (c == '\r') continue;
-    if (c == '\n') {
-      if (serialRxLen > 0) {
-        serialRxBuf[serialRxLen] = '\0';
-        handleSerialCommand(serialRxBuf);
-        serialRxLen = 0;
-      }
-    } else if (serialRxLen + 1 < sizeof(serialRxBuf)) {
-      serialRxBuf[serialRxLen++] = c;
-    }
-  }
-  if (serialRxLen > 0 && (now - lastSerialRxMs > 150UL)) {
+  pumpSerialRx();
+  if (serialLineReady || (serialRxLen > 0 && (now - lastSerialRxMs > 120UL))) {
     serialRxBuf[serialRxLen] = '\0';
-    handleSerialCommand(serialRxBuf);
     serialRxLen = 0;
+    serialLineReady = false;
+    handleSerialCommand(serialRxBuf);
   }
 }
 
@@ -1534,7 +1575,9 @@ void loop() {
   refreshLcdWeather(false);
 
   unsigned long now = millis();
-  if (stateDirty || (now - lastStateSentMs >= STATE_HEARTBEAT_MS)) {
+  // 시리얼 모니터 입력 중(최근 3초 이내)에는 상태 변경(stateDirty) 시에만 BT 전송하여 SoftwareSerial 인터럽트 충돌 방지
+  bool serialBusy = (serialRxLen > 0) || Serial.available() || (now - lastSerialRxMs < 3000UL);
+  if (stateDirty || (!serialBusy && (now - lastStateSentMs >= 2000UL))) {
     stateDirty = false;
     lastStateSentMs = now;
     sendStateSnapshot(bluetooth);
