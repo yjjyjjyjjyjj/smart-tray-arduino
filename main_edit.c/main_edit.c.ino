@@ -40,7 +40,7 @@ const byte IR_DETECTED_LEVEL = LOW;            // 장애물 감지 = LOW
 
 const unsigned long DEBOUNCE_MS        = 40UL;
 const unsigned long STATE_HEARTBEAT_MS = 1000UL;  // 1초 주기 상태 스냅샷 전송
-const unsigned long NORMAL_BLINK_MS    = 1500UL;  // 일반 백색 LED 1.5초 점멸 주기
+const unsigned long NORMAL_BLINK_MS    = 750UL;   // 일반 백색 LED 0.75초 점멸 주기
 const unsigned long NORMAL_MAX_MS      = 60000UL; // 문 열림 일반 점등 최대 유지 시간 (60초)
 const unsigned long HX_TIMEOUT_MS      = 1500UL;  // 로드셀 응답 타임아웃
 
