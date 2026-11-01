@@ -109,6 +109,7 @@ struct SpaceOutputRuntime {
   unsigned long normalUntilMs;      // 수동 테스트 시 일반 점멸 종료 시각
   bool sterilActive;
   unsigned long sterilUntilMs;
+  bool sterilPaused;                // 수동 중지(stop_steril / LED OFF) 시 현재 거치 사이클 일시 중지
   bool manualOverride;              // 시리얼 수동 명령 시 센서 조건 무시 플래그
   char activeReqId[12];
   byte currentStateCode;            // 0:OFF, 1:WHITE, 2:PURPLE
@@ -596,6 +597,34 @@ bool performTare(byte ch, bool saveEeprom = false, unsigned long timeoutMs = 150
 // ==============================================================================
 // 10. 출력 장치(공용 LED 3채널, 건조 팬) 제어 및 이벤트 트리거
 // ==============================================================================
+bool isRainOrSnowWeather() {
+  return weatherLcd.valid &&
+         (weatherLcd.icon == W_ICON_RAIN || weatherLcd.icon == W_ICON_SNOW);
+}
+
+bool isSpaceItemPresent(byte spaceIdx) {
+  if (spaceIdx < NUM_TRAYS) return (trays[spaceIdx].health == SENSOR_OK) && trays[spaceIdx].present;
+  if (spaceIdx == 2) return (umbrella.health == SENSOR_OK) && umbrella.active;
+  return false;
+}
+
+bool isSpaceSensorOk(byte spaceIdx) {
+  if (spaceIdx < NUM_TRAYS) return trays[spaceIdx].health == SENSOR_OK;
+  if (spaceIdx == 2) return umbrella.health == SENSOR_OK;
+  return false;
+}
+
+// 현관문이 열렸을 때 해당 칸의 일반 백색 LED를 점멸해야 하는지 판단
+// - 1, 2번 트레이: 물건이 놓여 있으면 점멸
+// - 3번 우산 공간: 우산이 놓여 있고, 오늘 날씨가 비(RAIN) 또는 눈(SNOW)일 때만 점멸
+bool shouldDoorBlinkSpace(byte spaceIdx) {
+  if (!door.active || !isSpaceItemPresent(spaceIdx)) return false;
+  uint8_t flags = config.spaceFlags[spaceIdx];
+  if (!(flags & CFG_LED_EN) || !(flags & CFG_LED_DOOR)) return false;
+  if (spaceIdx == 2) return isRainOrSnowWeather();
+  return true;
+}
+
 void startSterilization(byte spaceIdx, const char* reqId = NULL) {
   if (spaceIdx >= NUM_SPACES) return;
   uint8_t sec = config.sterilSec[spaceIdx];
@@ -603,6 +632,7 @@ void startSterilization(byte spaceIdx, const char* reqId = NULL) {
 
   outputs[spaceIdx].sterilActive   = true;
   outputs[spaceIdx].sterilUntilMs  = millis() + ((unsigned long)sec * 1000UL);
+  outputs[spaceIdx].sterilPaused   = false;
   outputs[spaceIdx].manualOverride = false;
   if (reqId && reqId[0]) {
     strncpy(outputs[spaceIdx].activeReqId, reqId, sizeof(outputs[spaceIdx].activeReqId) - 1);
@@ -664,36 +694,33 @@ void stopFan(PGM_P reasonP = NULL, bool completed = false) {
   stateDirty = true;
 }
 
-bool isSpaceItemPresent(byte spaceIdx) {
-  if (spaceIdx < NUM_TRAYS) return (trays[spaceIdx].health == SENSOR_OK) && trays[spaceIdx].present;
-  if (spaceIdx == 2) return (umbrella.health == SENSOR_OK) && umbrella.active;
-  return false;
-}
-
-bool isSpaceSensorOk(byte spaceIdx) {
-  if (spaceIdx < NUM_TRAYS) return trays[spaceIdx].health == SENSOR_OK;
-  if (spaceIdx == 2) return umbrella.health == SENSOR_OK;
-  return false;
-}
-
 void onSpaceItemChanged(byte spaceIdx, bool nowPresent) {
   if (spaceIdx >= NUM_SPACES) return;
-  uint8_t flags = config.spaceFlags[spaceIdx];
+  unsigned long now = millis();
+  outputs[spaceIdx].sterilPaused   = false;
+  outputs[spaceIdx].manualOverride = false;
 
   if (nowPresent) {
-    // 거치 감지 시 일반 LED 즉시 소등
-    outputs[spaceIdx].normalActive   = false;
-    outputs[spaceIdx].manualOverride = false;
-
-    if ((flags & CFG_STERIL_EN) && (flags & CFG_STERIL_DETECT) && !outputs[spaceIdx].sterilActive) {
+    if (!door.active) {
+      // 문이 닫힌 상태에서 물건/우산 거치 시: 보라색 살균 LED 연속 점등 시작
+      outputs[spaceIdx].normalActive = false;
       startSterilization(spaceIdx, NULL);
+    } else {
+      // 문이 열린 상태일 때: 조건(트레이1·2 또는 비/눈 오는 날 우산) 충족 시 일반 백색 점멸
+      outputs[spaceIdx].sterilActive = false;
+      if (shouldDoorBlinkSpace(spaceIdx)) {
+        outputs[spaceIdx].normalActive    = true;
+        outputs[spaceIdx].normalStartedMs = now;
+        outputs[spaceIdx].normalUntilMs   = now + NORMAL_MAX_MS;
+      } else {
+        outputs[spaceIdx].normalActive = false;
+      }
     }
     if (spaceIdx == 2 && config.fanDurationSec > 0) {
       startFan(config.fanDurationSec, NULL);
     }
   } else {
-    outputs[spaceIdx].normalActive   = false;
-    outputs[spaceIdx].manualOverride = false;
+    outputs[spaceIdx].normalActive = false;
     if (outputs[spaceIdx].sterilActive) stopSterilization(spaceIdx, PSTR("item_removed"), false);
     if (spaceIdx == 2 && fan.active) stopFan(PSTR("item_removed"), false);
   }
@@ -705,24 +732,34 @@ void onDoorStateChanged(bool nowOpen) {
   unsigned long now = millis();
   if (nowOpen) {
     for (byte s = 0; s < NUM_SPACES; ++s) {
-      if (isSpaceItemPresent(s)) {
-        uint8_t flags = config.spaceFlags[s];
-        if ((flags & CFG_LED_EN) && (flags & CFG_LED_DOOR)) {
+      outputs[s].sterilPaused = false;
+      if (!outputs[s].manualOverride) {
+        // 문이 열리면 닫힘 살균 LED를 멈추고 외출 알림(백색 점멸) 조건을 우선 평가
+        if (outputs[s].sterilActive) {
+          outputs[s].sterilActive = false;
+          outputs[s].activeReqId[0] = '\0';
+        }
+        if (shouldDoorBlinkSpace(s)) {
           outputs[s].normalActive    = true;
           outputs[s].normalStartedMs = now;
           outputs[s].normalUntilMs   = now + NORMAL_MAX_MS;
-          outputs[s].manualOverride  = false;
-        }
-        if ((flags & CFG_STERIL_EN) && (flags & CFG_STERIL_DOOR) && !outputs[s].sterilActive) {
-          startSterilization(s, NULL);
+        } else {
+          outputs[s].normalActive = false;
         }
       }
     }
     blinkPhaseOn = true;
     lastBlinkToggleMs = now;
   } else {
+    // 문이 닫히면 일반 백색 점멸을 즉시 끄고, 물건/우산이 있는 칸은 살균 LED 연속 점등 재개
     for (byte s = 0; s < NUM_SPACES; ++s) {
-      if (!outputs[s].manualOverride) outputs[s].normalActive = false;
+      outputs[s].sterilPaused = false;
+      if (!outputs[s].manualOverride) {
+        outputs[s].normalActive = false;
+        if (isSpaceItemPresent(s)) {
+          startSterilization(s, NULL);
+        }
+      }
     }
   }
   ledsNeedHardwareRefresh = true;
@@ -751,29 +788,74 @@ void evaluateOutputs() {
                  (commMode == MODE_BT && (bluetooth.available() > 0 || btRxLen > 0)));
 
   for (byte s = 0; s < NUM_SPACES; ++s) {
-    uint8_t flags = config.spaceFlags[s];
+    uint8_t sec = config.sterilSec[s];
+    if (sec != 5 && sec != 10 && sec != 20 && sec != 30) sec = 10;
 
-    if (outputs[s].sterilActive) {
-      if ((int32_t)(now - outputs[s].sterilUntilMs) >= 0) {
+    if (outputs[s].manualOverride) {
+      // 시리얼 수동 제어 모드일 때는 타이머 만료만 체크
+      if (outputs[s].sterilActive && (int32_t)(now - outputs[s].sterilUntilMs) >= 0) {
         stopSterilization(s, PSTR("duration_elapsed"), true);
-      } else if (!outputs[s].manualOverride) {
-        if (!(flags & CFG_STERIL_EN)) stopSterilization(s, PSTR("disabled"), false);
-        else if (!isSpaceItemPresent(s)) stopSterilization(s, PSTR("item_removed"), false);
       }
-    }
-
-    if (outputs[s].normalActive) {
-      if ((int32_t)(now - outputs[s].normalUntilMs) >= 0) {
+      if (outputs[s].normalActive && (int32_t)(now - outputs[s].normalUntilMs) >= 0) {
         outputs[s].normalActive   = false;
         outputs[s].manualOverride = false;
         ledsNeedHardwareRefresh = true;
         stateDirty = true;
-      } else if (!outputs[s].manualOverride) {
-        if (!(flags & CFG_LED_EN) || !(flags & CFG_LED_DOOR) ||
-            !door.active || !isSpaceItemPresent(s)) {
+      }
+    } else {
+      // 자동 센서 연동 모드
+      if (!door.active) {
+        // [문 닫힘 상태] 일반 백색 점멸은 끄고, 물건/우산이 거치되어 있으면 보라색 살균 LED 연속 유지
+        if (outputs[s].normalActive) {
           outputs[s].normalActive = false;
           ledsNeedHardwareRefresh = true;
           stateDirty = true;
+        }
+        if (isSpaceItemPresent(s) && !outputs[s].sterilPaused) {
+          if (!outputs[s].sterilActive) {
+            outputs[s].sterilActive  = true;
+            outputs[s].sterilUntilMs = now + ((unsigned long)sec * 1000UL);
+            ledsNeedHardwareRefresh = true;
+            stateDirty = true;
+          } else if ((int32_t)(now - outputs[s].sterilUntilMs) >= 0) {
+            // 앱 수동 요청 ID가 있었다면 완료 ACK 전송 후, 문 닫힘 연속 살균 타이머 자동 갱신
+            if (outputs[s].activeReqId[0]) {
+              sendAckP(outputs[s].activeReqId, PSTR("completed"), PSTR("duration_elapsed"));
+              outputs[s].activeReqId[0] = '\0';
+            }
+            outputs[s].sterilUntilMs = now + ((unsigned long)sec * 1000UL);
+          }
+        } else {
+          if (outputs[s].sterilActive) {
+            stopSterilization(s, PSTR("item_removed"), false);
+          }
+        }
+      } else {
+        // [문 열림 상태] 닫힘 연속 살균을 멈추고, 미수거 물건(또는 비/눈 오는 날 우산) 일반 백색 점멸 수행
+        if (outputs[s].sterilActive && outputs[s].activeReqId[0] == '\0') {
+          outputs[s].sterilActive = false;
+          ledsNeedHardwareRefresh = true;
+          stateDirty = true;
+        } else if (outputs[s].sterilActive && (int32_t)(now - outputs[s].sterilUntilMs) >= 0) {
+          stopSterilization(s, PSTR("duration_elapsed"), true);
+        }
+
+        if (shouldDoorBlinkSpace(s)) {
+          if (!outputs[s].normalActive) {
+            outputs[s].normalActive    = true;
+            outputs[s].normalStartedMs = now;
+            outputs[s].normalUntilMs   = now + NORMAL_MAX_MS;
+            ledsNeedHardwareRefresh = true;
+            stateDirty = true;
+          } else if ((int32_t)(now - outputs[s].normalUntilMs) >= 0) {
+            outputs[s].normalUntilMs = now + NORMAL_MAX_MS;
+          }
+        } else {
+          if (outputs[s].normalActive) {
+            outputs[s].normalActive = false;
+            ledsNeedHardwareRefresh = true;
+            stateDirty = true;
+          }
         }
       }
     }
@@ -929,10 +1011,12 @@ void printLedModeStr(Stream &out, LedLogicalMode m) {
   else out.print(F("off"));
 }
 
-unsigned long remainingMs(bool active, unsigned long untilMs) {
+unsigned long remainingMs(bool active, unsigned long untilMs, unsigned long maxCap = 30000UL) {
   if (!active) return 0UL;
   long diff = (long)(untilMs - millis());
-  return (diff > 0) ? (unsigned long)diff : 0UL;
+  if (diff <= 0) return 0UL;
+  unsigned long u = (unsigned long)diff;
+  return (u > maxCap) ? maxCap : u;
 }
 
 bool serialLineReady = false;
@@ -1019,7 +1103,7 @@ void sendStateSnapshot(Stream &out) {
   out.print(F("},\"fan\":{\"active\":"));
   out.print(fan.active ? F("true") : F("false"));
   out.print(F(",\"rem_ms\":"));
-  out.print(remainingMs(fan.active, fan.untilMs));
+  out.print(remainingMs(fan.active, fan.untilMs, 60000UL));
   out.println(F("}}"));
   pumpSerialRx();
 }
@@ -1171,12 +1255,9 @@ void handleJsonMessage(const char* line, Stream &replyStream) {
       }
     }
 
-    if (!(flags & CFG_STERIL_EN) && outputs[idx].sterilActive) {
-      stopSterilization(idx, PSTR("disabled"), false);
-    }
     if (!(flags & CFG_LED_EN) || !(flags & CFG_LED_DOOR)) {
       if (!outputs[idx].manualOverride) outputs[idx].normalActive = false;
-    } else if (door.active && isSpaceItemPresent(idx) && !outputs[idx].normalActive) {
+    } else if (shouldDoorBlinkSpace(idx) && !outputs[idx].normalActive) {
       unsigned long now = millis();
       outputs[idx].normalActive    = true;
       outputs[idx].normalStartedMs = now;
@@ -1200,19 +1281,21 @@ void handleJsonMessage(const char* line, Stream &replyStream) {
     if (strcmp_P(action, PSTR("start_steril")) == 0 || strcmp_P(action, PSTR("start_sterilization")) == 0) {
       if (space < 1 || space > 3) { sendAckP(reqId, PSTR("rejected"), PSTR("invalid_space")); stateDirty = true; return; }
       byte idx = (byte)(space - 1);
-      if (!(config.spaceFlags[idx] & CFG_STERIL_EN)) { sendAckP(reqId, PSTR("rejected"), PSTR("steril_disabled")); stateDirty = true; return; }
       if (!isSpaceSensorOk(idx)) { sendAckP(reqId, PSTR("rejected"), PSTR("sensor_error")); stateDirty = true; return; }
       if (!isSpaceItemPresent(idx)) { sendAckP(reqId, PSTR("rejected"), PSTR("no_item")); stateDirty = true; return; }
-      if (outputs[idx].sterilActive) { sendAckP(reqId, PSTR("rejected"), PSTR("already_running")); stateDirty = true; return; }
 
+      config.spaceFlags[idx] |= CFG_STERIL_EN;
+      outputs[idx].sterilPaused = false;
       sendAckP(reqId, PSTR("accepted"));
       startSterilization(idx, reqId);
       return;
     }
     if (strcmp_P(action, PSTR("stop_steril")) == 0 || strcmp_P(action, PSTR("stop_sterilization")) == 0) {
       if (space < 1 || space > 3) { sendAckP(reqId, PSTR("rejected"), PSTR("invalid_space")); stateDirty = true; return; }
+      byte idx = (byte)(space - 1);
+      outputs[idx].sterilPaused = true;
       sendAckP(reqId, PSTR("accepted"));
-      stopSterilization((byte)(space - 1), PSTR("manual_stop"), false);
+      stopSterilization(idx, PSTR("manual_stop"), false);
       return;
     }
     if (strcmp_P(action, PSTR("start_fan")) == 0) {
@@ -1539,6 +1622,7 @@ void handleSerialCommand(char* line, bool fromSerial = true) {
         config.spaceFlags[s] |= CFG_STERIL_EN;
         outputs[s].normalActive   = false;
         outputs[s].sterilActive   = true;
+        outputs[s].sterilPaused   = false;
         outputs[s].sterilUntilMs  = now + ((unsigned long)dur * 1000UL);
         outputs[s].manualOverride = true;
         outputs[s].activeReqId[0] = '\0';
@@ -1560,6 +1644,7 @@ void handleSerialCommand(char* line, bool fromSerial = true) {
       } else if (strcmp_P(modeStr, PSTR("OFF")) == 0 || strcmp_P(modeStr, PSTR("0")) == 0 || strcmp_P(modeStr, PSTR("BLACK")) == 0) {
         outputs[s].sterilActive   = false;
         outputs[s].normalActive   = false;
+        outputs[s].sterilPaused   = true;
         outputs[s].manualOverride = false;
         outputs[s].currentStateCode = 0;
         writeStripHardware(s, 0, 0, 0);
