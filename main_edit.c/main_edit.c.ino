@@ -110,6 +110,7 @@ struct SpaceOutputRuntime {
   bool sterilActive;
   unsigned long sterilUntilMs;
   bool sterilPaused;                // 수동 중지(stop_steril / LED OFF) 시 현재 거치 사이클 일시 중지
+  bool itemPresentAtDoorOpen;       // 문이 열리는 순간 이미 물건이 놓여 있었는지 여부
   bool manualOverride;              // 시리얼 수동 명령 시 센서 조건 무시 플래그
   char activeReqId[12];
   byte currentStateCode;            // 0:OFF, 1:WHITE, 2:PURPLE
@@ -615,10 +616,12 @@ bool isSpaceSensorOk(byte spaceIdx) {
 }
 
 // 현관문이 열렸을 때 해당 칸의 일반 백색 LED를 점멸해야 하는지 판단
-// - 1, 2번 트레이: 물건이 놓여 있으면 점멸
-// - 3번 우산 공간: 우산이 놓여 있고, 오늘 날씨가 비(RAIN) 또는 눈(SNOW)일 때만 점멸
+// - 문이 열리는 시점에 이미 물건이 놓여 있었던 칸(itemPresentAtDoorOpen)만 점멸 대상
+// - 1, 2번 트레이: 물건이 놓여 있었으면 점멸
+// - 3번 우산 공간: 우산이 놓여 있었고, 오늘 날씨가 비(RAIN) 또는 눈(SNOW)일 때만 점멸
 bool shouldDoorBlinkSpace(byte spaceIdx) {
   if (!door.active || !isSpaceItemPresent(spaceIdx)) return false;
+  if (!outputs[spaceIdx].itemPresentAtDoorOpen) return false;
   uint8_t flags = config.spaceFlags[spaceIdx];
   if (!(flags & CFG_LED_EN) || !(flags & CFG_LED_DOOR)) return false;
   if (spaceIdx == 2) return isRainOrSnowWeather();
@@ -696,30 +699,28 @@ void stopFan(PGM_P reasonP = NULL, bool completed = false) {
 
 void onSpaceItemChanged(byte spaceIdx, bool nowPresent) {
   if (spaceIdx >= NUM_SPACES) return;
-  unsigned long now = millis();
   outputs[spaceIdx].sterilPaused   = false;
   outputs[spaceIdx].manualOverride = false;
 
   if (nowPresent) {
+    // 새로 물건이 들어온 경우 외출 미수거 점멸은 끔
+    outputs[spaceIdx].itemPresentAtDoorOpen = false;
+    outputs[spaceIdx].normalActive = false;
+
     if (!door.active) {
-      // 문이 닫힌 상태에서 물건/우산 거치 시: 보라색 살균 LED 연속 점등 시작
-      outputs[spaceIdx].normalActive = false;
+      // 문이 닫혀 있을 때만 즉시 보라색 살균 LED 연속 점등 시작
       startSterilization(spaceIdx, NULL);
     } else {
-      // 문이 열린 상태일 때: 조건(트레이1·2 또는 비/눈 오는 날 우산) 충족 시 일반 백색 점멸
-      outputs[spaceIdx].sterilActive = false;
-      if (shouldDoorBlinkSpace(spaceIdx)) {
-        outputs[spaceIdx].normalActive    = true;
-        outputs[spaceIdx].normalStartedMs = now;
-        outputs[spaceIdx].normalUntilMs   = now + NORMAL_MAX_MS;
-      } else {
-        outputs[spaceIdx].normalActive = false;
+      // 문이 열려 있을 때 트레이에 물건이 들어가면 살균 LED는 작동하지 않음 (문이 닫힐 때 작동)
+      if (outputs[spaceIdx].sterilActive) {
+        stopSterilization(spaceIdx, PSTR("door_open"), false);
       }
     }
     if (spaceIdx == 2 && config.fanDurationSec > 0) {
       startFan(config.fanDurationSec, NULL);
     }
   } else {
+    outputs[spaceIdx].itemPresentAtDoorOpen = false;
     outputs[spaceIdx].normalActive = false;
     if (outputs[spaceIdx].sterilActive) stopSterilization(spaceIdx, PSTR("item_removed"), false);
     if (spaceIdx == 2 && fan.active) stopFan(PSTR("item_removed"), false);
@@ -733,11 +734,11 @@ void onDoorStateChanged(bool nowOpen) {
   if (nowOpen) {
     for (byte s = 0; s < NUM_SPACES; ++s) {
       outputs[s].sterilPaused = false;
+      outputs[s].itemPresentAtDoorOpen = isSpaceItemPresent(s);
       if (!outputs[s].manualOverride) {
-        // 문이 열리면 닫힘 살균 LED를 멈추고 외출 알림(백색 점멸) 조건을 우선 평가
+        // 문이 열리면 살균 LED는 즉시 종료하고 외출 알림(백색 점멸) 조건을 평가
         if (outputs[s].sterilActive) {
-          outputs[s].sterilActive = false;
-          outputs[s].activeReqId[0] = '\0';
+          stopSterilization(s, PSTR("door_open"), false);
         }
         if (shouldDoorBlinkSpace(s)) {
           outputs[s].normalActive    = true;
@@ -751,9 +752,10 @@ void onDoorStateChanged(bool nowOpen) {
     blinkPhaseOn = true;
     lastBlinkToggleMs = now;
   } else {
-    // 문이 닫히면 일반 백색 점멸을 즉시 끄고, 물건/우산이 있는 칸은 살균 LED 연속 점등 재개
+    // 문이 닫히면 일반 백색 점멸을 즉시 끄고, 물건/우산이 들어 있는 모든 칸에 살균 LED 연속 점등 적용
     for (byte s = 0; s < NUM_SPACES; ++s) {
       outputs[s].sterilPaused = false;
+      outputs[s].itemPresentAtDoorOpen = false;
       if (!outputs[s].manualOverride) {
         outputs[s].normalActive = false;
         if (isSpaceItemPresent(s)) {
@@ -831,13 +833,10 @@ void evaluateOutputs() {
           }
         }
       } else {
-        // [문 열림 상태] 닫힘 연속 살균을 멈추고, 미수거 물건(또는 비/눈 오는 날 우산) 일반 백색 점멸 수행
-        if (outputs[s].sterilActive && outputs[s].activeReqId[0] == '\0') {
-          outputs[s].sterilActive = false;
-          ledsNeedHardwareRefresh = true;
-          stateDirty = true;
-        } else if (outputs[s].sterilActive && (int32_t)(now - outputs[s].sterilUntilMs) >= 0) {
-          stopSterilization(s, PSTR("duration_elapsed"), true);
+        // [문 열림 상태] 문이 열려 있는 동안에는 살균 LED를 절대 켜지 않으며,
+        // 문이 열릴 때 이미 들어 있던 미수거 물건(또는 비/눈 오는 날 우산)만 일반 백색 점멸 수행
+        if (outputs[s].sterilActive) {
+          stopSterilization(s, PSTR("door_open"), false);
         }
 
         if (shouldDoorBlinkSpace(s)) {
@@ -1287,7 +1286,12 @@ void handleJsonMessage(const char* line, Stream &replyStream) {
       config.spaceFlags[idx] |= CFG_STERIL_EN;
       outputs[idx].sterilPaused = false;
       sendAckP(reqId, PSTR("accepted"));
-      startSterilization(idx, reqId);
+      // 문이 닫혀 있을 때만 즉시 살균 LED 점등 (문이 열려 있으면 문이 닫히는 순간 자동 점등)
+      if (!door.active) {
+        startSterilization(idx, reqId);
+      } else {
+        stateDirty = true;
+      }
       return;
     }
     if (strcmp_P(action, PSTR("stop_steril")) == 0 || strcmp_P(action, PSTR("stop_sterilization")) == 0) {
