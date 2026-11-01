@@ -105,8 +105,10 @@ struct DigitalSensorRuntime {
 struct SpaceOutputRuntime {
   bool normalActive;
   unsigned long normalStartedMs;
+  unsigned long normalUntilMs;      // 수동 테스트 시 일반 점멸 종료 시각
   bool sterilActive;
   unsigned long sterilUntilMs;
+  bool manualOverride;              // 시리얼 수동 명령 시 센서 조건 무시 플래그
   char activeReqId[12];
   byte currentStateCode;            // 0:OFF, 1:WHITE, 2:PURPLE
 };
@@ -123,6 +125,7 @@ DigitalSensorRuntime door;
 SpaceOutputRuntime outputs[NUM_SPACES];
 FanRuntime fan;
 
+uint8_t simMask = 0;                // bit0~2: 1~3번칸 가상거치, bit3: 현관문 가상고정
 bool blinkPhaseOn = true;
 unsigned long lastBlinkToggleMs = 0;
 bool ledsNeedHardwareRefresh = true;
@@ -597,8 +600,9 @@ void startSterilization(byte spaceIdx, const char* reqId = NULL) {
   uint8_t sec = config.sterilSec[spaceIdx];
   if (sec != 5 && sec != 10 && sec != 20 && sec != 30) sec = 10;
 
-  outputs[spaceIdx].sterilActive  = true;
-  outputs[spaceIdx].sterilUntilMs = millis() + ((unsigned long)sec * 1000UL);
+  outputs[spaceIdx].sterilActive   = true;
+  outputs[spaceIdx].sterilUntilMs  = millis() + ((unsigned long)sec * 1000UL);
+  outputs[spaceIdx].manualOverride = false;
   if (reqId && reqId[0]) {
     strncpy(outputs[spaceIdx].activeReqId, reqId, sizeof(outputs[spaceIdx].activeReqId) - 1);
     outputs[spaceIdx].activeReqId[11] = '\0';
@@ -611,8 +615,9 @@ void startSterilization(byte spaceIdx, const char* reqId = NULL) {
 void stopSterilization(byte spaceIdx, PGM_P reasonP = NULL, bool completed = false) {
   if (spaceIdx >= NUM_SPACES || !outputs[spaceIdx].sterilActive) return;
 
-  outputs[spaceIdx].sterilActive  = false;
-  outputs[spaceIdx].sterilUntilMs = 0;
+  outputs[spaceIdx].sterilActive   = false;
+  outputs[spaceIdx].sterilUntilMs  = 0;
+  outputs[spaceIdx].manualOverride = false;
   if (outputs[spaceIdx].activeReqId[0] && reasonP) {
     sendAckP(outputs[spaceIdx].activeReqId, completed ? PSTR("completed") : PSTR("stopped"), reasonP);
   }
@@ -667,7 +672,8 @@ void onSpaceItemChanged(byte spaceIdx, bool nowPresent) {
 
   if (nowPresent) {
     // 거치 감지 시 일반 LED 즉시 소등
-    outputs[spaceIdx].normalActive = false;
+    outputs[spaceIdx].normalActive   = false;
+    outputs[spaceIdx].manualOverride = false;
 
     if ((flags & CFG_STERIL_EN) && (flags & CFG_STERIL_DETECT) && !outputs[spaceIdx].sterilActive) {
       startSterilization(spaceIdx, NULL);
@@ -676,7 +682,8 @@ void onSpaceItemChanged(byte spaceIdx, bool nowPresent) {
       startFan(config.fanDurationSec, NULL);
     }
   } else {
-    outputs[spaceIdx].normalActive = false;
+    outputs[spaceIdx].normalActive   = false;
+    outputs[spaceIdx].manualOverride = false;
     if (outputs[spaceIdx].sterilActive) stopSterilization(spaceIdx, PSTR("item_removed"), false);
     if (spaceIdx == 2 && fan.active) stopFan(PSTR("item_removed"), false);
   }
@@ -690,8 +697,10 @@ void onDoorStateChanged(bool nowOpen) {
       if (isSpaceItemPresent(s)) {
         uint8_t flags = config.spaceFlags[s];
         if ((flags & CFG_LED_EN) && (flags & CFG_LED_DOOR)) {
-          outputs[s].normalActive = true;
+          outputs[s].normalActive    = true;
           outputs[s].normalStartedMs = now;
+          outputs[s].normalUntilMs   = now + NORMAL_MAX_MS;
+          outputs[s].manualOverride  = false;
         }
         if ((flags & CFG_STERIL_EN) && (flags & CFG_STERIL_DOOR) && !outputs[s].sterilActive) {
           startSterilization(s, NULL);
@@ -701,7 +710,9 @@ void onDoorStateChanged(bool nowOpen) {
     blinkPhaseOn = true;
     lastBlinkToggleMs = now;
   } else {
-    for (byte s = 0; s < NUM_SPACES; ++s) outputs[s].normalActive = false;
+    for (byte s = 0; s < NUM_SPACES; ++s) {
+      if (!outputs[s].manualOverride) outputs[s].normalActive = false;
+    }
   }
   stateDirty = true;
 }
@@ -728,17 +739,25 @@ void evaluateOutputs() {
     uint8_t flags = config.spaceFlags[s];
 
     if (outputs[s].sterilActive) {
-      if (!(flags & CFG_STERIL_EN)) stopSterilization(s, PSTR("disabled"), false);
-      else if (!isSpaceItemPresent(s)) stopSterilization(s, PSTR("item_removed"), false);
-      else if ((int32_t)(now - outputs[s].sterilUntilMs) >= 0) stopSterilization(s, PSTR("duration_elapsed"), true);
+      if ((int32_t)(now - outputs[s].sterilUntilMs) >= 0) {
+        stopSterilization(s, PSTR("duration_elapsed"), true);
+      } else if (!outputs[s].manualOverride) {
+        if (!(flags & CFG_STERIL_EN)) stopSterilization(s, PSTR("disabled"), false);
+        else if (!isSpaceItemPresent(s)) stopSterilization(s, PSTR("item_removed"), false);
+      }
     }
 
     if (outputs[s].normalActive) {
-      if (!(flags & CFG_LED_EN) || !(flags & CFG_LED_DOOR) ||
-          !door.active || !isSpaceItemPresent(s) ||
-          (now - outputs[s].normalStartedMs >= NORMAL_MAX_MS)) {
-        outputs[s].normalActive = false;
+      if ((int32_t)(now - outputs[s].normalUntilMs) >= 0) {
+        outputs[s].normalActive   = false;
+        outputs[s].manualOverride = false;
         stateDirty = true;
+      } else if (!outputs[s].manualOverride) {
+        if (!(flags & CFG_LED_EN) || !(flags & CFG_LED_DOOR) ||
+            !door.active || !isSpaceItemPresent(s)) {
+          outputs[s].normalActive = false;
+          stateDirty = true;
+        }
       }
     }
 
@@ -771,39 +790,44 @@ void pollSensors() {
 
   unsigned long now = millis();
 
-  // 1) 현관문 (A0)
-  byte rawDoor = digitalRead(DOOR_PIN);
-  if (rawDoor != door.rawLevel) {
-    door.rawLevel = rawDoor;
-    door.lastDebounceMs = now;
-  }
-  if (now - door.lastDebounceMs >= DEBOUNCE_MS && door.stableLevel != door.rawLevel) {
-    door.stableLevel = door.rawLevel;
-    bool nowOpen = (door.stableLevel != DOOR_CLOSED_LEVEL);
-    if (door.active != nowOpen) {
-      door.active = nowOpen;
-      onDoorStateChanged(nowOpen);
+  // 1) 현관문 (A0) - 가상 시뮬레이션(bit3) 중이 아닐 때만 물리 핀 폴링
+  if (!(simMask & 0x08)) {
+    byte rawDoor = digitalRead(DOOR_PIN);
+    if (rawDoor != door.rawLevel) {
+      door.rawLevel = rawDoor;
+      door.lastDebounceMs = now;
+    }
+    if (now - door.lastDebounceMs >= DEBOUNCE_MS && door.stableLevel != door.rawLevel) {
+      door.stableLevel = door.rawLevel;
+      bool nowOpen = (door.stableLevel != DOOR_CLOSED_LEVEL);
+      if (door.active != nowOpen) {
+        door.active = nowOpen;
+        onDoorStateChanged(nowOpen);
+      }
     }
   }
 
-  // 2) 우산 IR (A3)
-  byte rawIr = digitalRead(IR_PIN);
-  if (rawIr != umbrella.rawLevel) {
-    umbrella.rawLevel = rawIr;
-    umbrella.lastDebounceMs = now;
-  }
-  if (now - umbrella.lastDebounceMs >= DEBOUNCE_MS && umbrella.stableLevel != umbrella.rawLevel) {
-    umbrella.stableLevel = umbrella.rawLevel;
-    bool nowPresent = (umbrella.stableLevel == IR_DETECTED_LEVEL);
-    umbrella.health = SENSOR_OK;
-    if (umbrella.active != nowPresent) {
-      umbrella.active = nowPresent;
-      onSpaceItemChanged(2, nowPresent);
+  // 2) 우산 IR (A3) - 가상 시뮬레이션(bit2) 중이 아닐 때만 물리 핀 폴링
+  if (!(simMask & 0x04)) {
+    byte rawIr = digitalRead(IR_PIN);
+    if (rawIr != umbrella.rawLevel) {
+      umbrella.rawLevel = rawIr;
+      umbrella.lastDebounceMs = now;
+    }
+    if (now - umbrella.lastDebounceMs >= DEBOUNCE_MS && umbrella.stableLevel != umbrella.rawLevel) {
+      umbrella.stableLevel = umbrella.rawLevel;
+      bool nowPresent = (umbrella.stableLevel == IR_DETECTED_LEVEL);
+      umbrella.health = SENSOR_OK;
+      if (umbrella.active != nowPresent) {
+        umbrella.active = nowPresent;
+        onSpaceItemChanged(2, nowPresent);
+      }
     }
   }
 
-  // 3) 로드셀 1·2번 칸
+  // 3) 로드셀 1·2번 칸 - 가상 시뮬레이션(bit0, bit1) 중이 아닐 때만 물리 폴링
   for (byte i = 0; i < NUM_TRAYS; ++i) {
+    if (simMask & (1 << i)) continue;
     if (Serial.available() > 0) return;
     long raw;
     if (readHX711Raw(i, raw)) {
@@ -1382,90 +1406,176 @@ void handleSerialCommand(char* line) {
     stateDirty = true;
   }
   else if (strcmp_P(cmd, PSTR("SCALE")) == 0) {
-    int ch = atoi(strtok(NULL, " \t")) - 1;
-    long sc10 = parseDeci(strtok(NULL, " \t"));
+    char* a1 = strtok(NULL, " \t");
+    char* a2 = strtok(NULL, " \t");
+    int ch = a1 ? (atoi(a1) - 1) : -1;
+    long sc10 = parseDeci(a2);
     if (ch >= 0 && ch < NUM_TRAYS && labs(sc10) > 0) {
       config.scaleX10[ch] = sc10;
-      Serial.println(F(">> SCALE OK"));
+      Serial.print(F(">> SCALE CH")); Serial.print(ch + 1);
+      Serial.print('='); printDeci(Serial, sc10); Serial.println();
+    } else {
+      Serial.println(F(">> USE: SCALE <1|2> <val>"));
     }
   }
   else if (strcmp_P(cmd, PSTR("TH")) == 0) {
-    int ch = atoi(strtok(NULL, " \t")) - 1;
-    long det = parseDeci(strtok(NULL, " \t"));
-    long rel = parseDeci(strtok(NULL, " \t"));
-    if (ch >= 0 && ch < NUM_TRAYS && det >= 20) {
+    char* a1 = strtok(NULL, " \t");
+    char* a2 = strtok(NULL, " \t");
+    char* a3 = strtok(NULL, " \t");
+    int ch = a1 ? (atoi(a1) - 1) : -1;
+    long det = parseDeci(a2);
+    long rel = parseDeci(a3);
+    if (ch >= 0 && ch < NUM_TRAYS && det >= 10) {
       config.detectDg[ch]  = (int16_t)det;
       config.releaseDg[ch] = (int16_t)((rel > 0) ? rel : (det / 2));
-      Serial.println(F(">> TH OK"));
+      Serial.print(F(">> TH CH")); Serial.print(ch + 1);
+      Serial.print('='); printDeci(Serial, config.detectDg[ch]);
+      Serial.print('/'); printDeci(Serial, config.releaseDg[ch]); Serial.println(F("g"));
+    } else {
+      Serial.println(F(">> USE: TH <1|2> <detect_g> [release_g]"));
     }
   }
   else if (strcmp_P(cmd, PSTR("DZ")) == 0) {
-    int ch = atoi(strtok(NULL, " \t")) - 1;
-    long dz = parseDeci(strtok(NULL, " \t"));
-    if (ch >= 0 && ch < NUM_TRAYS && dz >= 0 && dz <= 300) {
+    char* a1 = strtok(NULL, " \t");
+    char* a2 = strtok(NULL, " \t");
+    int ch = a1 ? (atoi(a1) - 1) : -1;
+    long dz = parseDeci(a2);
+    if (a2 && ch >= 0 && ch < NUM_TRAYS && dz >= 0 && dz <= 500) {
       config.deadzoneDg[ch] = (int16_t)dz;
-      Serial.println(F(">> DZ OK"));
+      Serial.print(F(">> DZ CH")); Serial.print(ch + 1);
+      Serial.print('='); printDeci(Serial, dz); Serial.println(F("g"));
+    } else {
+      Serial.println(F(">> USE: DZ <1|2> <g>"));
     }
   }
-  else if (strcmp_P(cmd, PSTR("LED")) == 0) {
-    char* targetStr = strtok(NULL, " \t");
-    char* modeStr   = strtok(NULL, " \t");
-    char* secStr    = strtok(NULL, " \t");
-    if (!targetStr || !modeStr) return;
-    toUpperStr(targetStr);
-    toUpperStr(modeStr);
+  else if (strcmp_P(cmd, PSTR("LED")) == 0 || strcmp_P(cmd, PSTR("LEDON")) == 0 || strcmp_P(cmd, PSTR("LEDOFF")) == 0) {
+    char* tok1 = strtok(NULL, " \t");
+    char* tok2 = strtok(NULL, " \t");
+    char* tok3 = strtok(NULL, " \t");
+    if (tok1) toUpperStr(tok1);
+    if (tok2) toUpperStr(tok2);
+
     byte s0 = 0, s1 = NUM_SPACES - 1;
-    if (strcmp_P(targetStr, PSTR("ALL")) != 0) {
-      int sp = atoi(targetStr);
-      if (sp < 1 || sp > 3) return;
-      s0 = s1 = (byte)(sp - 1);
+    char modeBuf[8];
+    char* modeStr = NULL;
+    char* secStr  = NULL;
+
+    if (strcmp_P(cmd, PSTR("LEDON")) == 0) {
+      copyStrP(modeBuf, PSTR("BLINK"), sizeof(modeBuf));
+      modeStr = modeBuf;
+    } else if (strcmp_P(cmd, PSTR("LEDOFF")) == 0) {
+      copyStrP(modeBuf, PSTR("OFF"), sizeof(modeBuf));
+      modeStr = modeBuf;
+    } else if (!tok1) {
+      Serial.println(F(">> USE: LED <1|2|3|ALL> <STERIL|BLINK|OFF> [sec]"));
+      return;
+    } else if (strcmp_P(tok1, PSTR("1")) == 0 || strcmp_P(tok1, PSTR("2")) == 0 || strcmp_P(tok1, PSTR("3")) == 0) {
+      s0 = s1 = (byte)(*tok1 - '1');
+      modeStr = tok2;
+      secStr  = tok3;
+    } else if (strcmp_P(tok1, PSTR("ALL")) == 0) {
+      modeStr = tok2;
+      secStr  = tok3;
+    } else {
+      // 채널 생략 시(예: led steril, led blink, led on, led off, led purple, led white) 전체 채널(ALL)에 적용
+      modeStr = tok1;
+      secStr  = tok2;
     }
-    int sec = secStr ? atoi(secStr) : 10;
-    if (sec < 1 || sec > 300) sec = 10;
+
+    if (!modeStr) {
+      Serial.println(F(">> USE: LED <1|2|3|ALL> <STERIL|BLINK|OFF> [sec]"));
+      return;
+    }
+
+    int sec = secStr ? atoi(secStr) : 0;
+    unsigned long now = millis();
 
     for (byte s = s0; s <= s1; ++s) {
-      if (strcmp_P(modeStr, PSTR("STERIL")) == 0) {
+      if (strcmp_P(modeStr, PSTR("STERIL")) == 0 || strcmp_P(modeStr, PSTR("PURPLE")) == 0 || strcmp_P(modeStr, PSTR("UV")) == 0) {
+        int dur = (sec >= 1 && sec <= 600) ? sec : 10;
         config.spaceFlags[s] |= CFG_STERIL_EN;
-        outputs[s].sterilActive = true;
-        outputs[s].sterilUntilMs = millis() + ((unsigned long)sec * 1000UL);
+        outputs[s].normalActive   = false;
+        outputs[s].sterilActive   = true;
+        outputs[s].sterilUntilMs  = now + ((unsigned long)dur * 1000UL);
+        outputs[s].manualOverride = true;
         outputs[s].activeReqId[0] = '\0';
-      } else if (strcmp_P(modeStr, PSTR("BLINK")) == 0) {
+        outputs[s].currentStateCode = 2;
+        writeStripHardware(s, 150, 0, 255);
+      } else if (strcmp_P(modeStr, PSTR("BLINK")) == 0 || strcmp_P(modeStr, PSTR("NORMAL")) == 0 ||
+                 strcmp_P(modeStr, PSTR("WHITE")) == 0 || strcmp_P(modeStr, PSTR("ON")) == 0 || strcmp_P(modeStr, PSTR("1")) == 0) {
+        int dur = (sec >= 1 && sec <= 600) ? sec : 60;
         config.spaceFlags[s] |= (CFG_LED_EN | CFG_LED_DOOR);
-        outputs[s].sterilActive = false;
-        outputs[s].normalActive = true;
-        outputs[s].normalStartedMs = millis();
+        outputs[s].sterilActive    = false;
+        outputs[s].normalActive    = true;
+        outputs[s].normalStartedMs = now;
+        outputs[s].normalUntilMs   = now + ((unsigned long)dur * 1000UL);
+        outputs[s].manualOverride  = true;
         blinkPhaseOn = true;
-        lastBlinkToggleMs = millis();
+        lastBlinkToggleMs = now;
+        outputs[s].currentStateCode = 1;
+        writeStripHardware(s, 120, 120, 120);
+      } else if (strcmp_P(modeStr, PSTR("OFF")) == 0 || strcmp_P(modeStr, PSTR("0")) == 0 || strcmp_P(modeStr, PSTR("BLACK")) == 0) {
+        outputs[s].sterilActive   = false;
+        outputs[s].normalActive   = false;
+        outputs[s].manualOverride = false;
+        outputs[s].currentStateCode = 0;
+        writeStripHardware(s, 0, 0, 0);
       } else {
-        outputs[s].sterilActive = false;
-        outputs[s].normalActive = false;
+        Serial.println(F(">> USE: LED <1|2|3|ALL> <STERIL|BLINK|OFF> [sec]"));
+        return;
       }
     }
     ledsNeedHardwareRefresh = true;
     stateDirty = true;
-    Serial.println(F(">> LED OK"));
+    Serial.print(F(">> LED [")); Serial.print(s0 + 1);
+    if (s1 > s0) { Serial.print('-'); Serial.print(s1 + 1); }
+    Serial.print(F("] -> ")); Serial.println(modeStr);
   }
-  else if (strcmp_P(cmd, PSTR("FAN")) == 0) {
+  else if (strcmp_P(cmd, PSTR("FAN")) == 0 || strcmp_P(cmd, PSTR("F")) == 0) {
     char* sub = strtok(NULL, " \t");
     char* secStr = strtok(NULL, " \t");
-    if (!sub) return;
+    if (strcmp_P(cmd, PSTR("F")) == 0 && !sub) {
+      if (fan.active) {
+        stopFan(PSTR("manual_stop"), false);
+        Serial.println(F(">> FAN OFF"));
+      } else {
+        startFan(30, NULL);
+        Serial.println(F(">> FAN ON (30s)"));
+      }
+      return;
+    }
+    if (!sub) {
+      Serial.println(F(">> USE: FAN ON [sec] | FAN OFF"));
+      return;
+    }
     toUpperStr(sub);
     if (strcmp_P(sub, PSTR("ON")) == 0 || strcmp_P(sub, PSTR("1")) == 0) {
       int sec = secStr ? atoi(secStr) : 30;
-      startFan((uint8_t)((sec > 0 && sec <= 240) ? sec : 30), NULL);
-      Serial.println(F(">> FAN ON"));
-    } else {
+      if (sec < 1 || sec > 240) sec = 30;
+      startFan((uint8_t)sec, NULL);
+      Serial.print(F(">> FAN ON (")); Serial.print(sec); Serial.println(F("s)"));
+    } else if (strcmp_P(sub, PSTR("OFF")) == 0 || strcmp_P(sub, PSTR("0")) == 0) {
       stopFan(PSTR("manual_stop"), false);
       Serial.println(F(">> FAN OFF"));
+    } else if (*sub >= '1' && *sub <= '9') {
+      int sec = atoi(sub);
+      if (sec < 1 || sec > 240) sec = 30;
+      startFan((uint8_t)sec, NULL);
+      Serial.print(F(">> FAN ON (")); Serial.print(sec); Serial.println(F("s)"));
+    } else {
+      Serial.println(F(">> USE: FAN ON [sec] | FAN OFF"));
     }
   }
   else if (strcmp_P(cmd, PSTR("LCD")) == 0) {
     char* sub = strtok(NULL, " \t");
-    if (!sub) return;
+    if (!sub) {
+      Serial.println(F(">> USE: LCD <WAIT|SUNNY|CLOUDY|RAIN|SNOW|NODATA> [w1] [w2]"));
+      return;
+    }
     toUpperStr(sub);
     weatherLcd.receivedOnce = true;
     if (strcmp_P(sub, PSTR("WAIT")) == 0) initWeatherDisplayWait();
-    else if (strcmp_P(sub, PSTR("SUNNY")) == 0) setWeatherPreset(W_ICON_SUNNY, PSTR("SUNNY"), PSTR("NO RAIN/SNOW"), true);
+    else if (strcmp_P(sub, PSTR("SUNNY")) == 0 || strcmp_P(sub, PSTR("CLEAR")) == 0) setWeatherPreset(W_ICON_SUNNY, PSTR("SUNNY"), PSTR("NO RAIN/SNOW"), true);
     else if (strcmp_P(sub, PSTR("CLOUDY")) == 0) setWeatherPreset(W_ICON_CLOUDY, PSTR("CLOUDY"), PSTR("NO RAIN/SNOW"), true);
     else if (strcmp_P(sub, PSTR("SNOW")) == 0) setWeatherPreset(W_ICON_SNOW, PSTR("SNOW"), PSTR("NO RAIN"), true);
     else if (strcmp_P(sub, PSTR("RAIN")) == 0) {
@@ -1481,35 +1591,56 @@ void handleSerialCommand(char* line) {
       }
     } else setWeatherNoData();
     refreshLcdWeather(true);
-    Serial.println(F(">> LCD OK"));
+    Serial.print(F(">> LCD OK: ")); Serial.println(sub);
   }
   else if (strcmp_P(cmd, PSTR("SIM")) == 0) {
     char* target = strtok(NULL, " \t");
     char* a1     = strtok(NULL, " \t");
     char* a2     = strtok(NULL, " \t");
-    if (!target || !a1) return;
+    if (!target) {
+      Serial.println(F(">> USE: SIM DOOR <OPEN|CLOSE> | SIM ITEM <1|2|3> <1|0> | SIM OFF"));
+      return;
+    }
     toUpperStr(target);
+    if (strcmp_P(target, PSTR("OFF")) == 0 || strcmp_P(target, PSTR("RESET")) == 0) {
+      simMask = 0;
+      Serial.println(F(">> SIM OFF (Real Sensors Active)"));
+      return;
+    }
+    if (!a1) {
+      Serial.println(F(">> USE: SIM DOOR <OPEN|CLOSE> | SIM ITEM <1|2|3> <1|0> | SIM OFF"));
+      return;
+    }
     toUpperStr(a1);
     if (strcmp_P(target, PSTR("DOOR")) == 0) {
       bool opn = (strcmp_P(a1, PSTR("OPEN")) == 0 || *a1 == '1');
+      simMask |= 0x08;
       door.active = opn;
       onDoorStateChanged(opn);
-      Serial.println(F(">> SIM DOOR OK"));
+      Serial.print(F(">> SIM DOOR=")); Serial.println(opn ? F("OPEN") : F("CLOSED"));
     } else if (strcmp_P(target, PSTR("ITEM")) == 0 && a2) {
       int sp = atoi(a1);
       bool pres = (*a2 != '0');
-      if (sp == 1 || sp == 2) {
-        trays[sp - 1].health = SENSOR_OK;
-        trays[sp - 1].present = pres;
-        trays[sp - 1].candidatePresent = pres;
-        trays[sp - 1].weightDg = pres ? 1200 : 0;
-        onSpaceItemChanged((byte)(sp - 1), pres);
-      } else if (sp == 3) {
-        umbrella.health = SENSOR_OK;
-        umbrella.active = pres;
-        onSpaceItemChanged(2, pres);
+      if (sp >= 1 && sp <= 3) {
+        simMask |= (1 << (sp - 1));
+        if (sp == 1 || sp == 2) {
+          trays[sp - 1].health = SENSOR_OK;
+          trays[sp - 1].present = pres;
+          trays[sp - 1].candidatePresent = pres;
+          trays[sp - 1].weightDg = pres ? 1200 : 0;
+          onSpaceItemChanged((byte)(sp - 1), pres);
+        } else {
+          umbrella.health = SENSOR_OK;
+          umbrella.active = pres;
+          onSpaceItemChanged(2, pres);
+        }
+        Serial.print(F(">> SIM ITEM #")); Serial.print(sp);
+        Serial.print('='); Serial.println(pres);
+      } else {
+        Serial.println(F(">> USE: SIM ITEM <1|2|3> <1|0>"));
       }
-      Serial.println(F(">> SIM ITEM OK"));
+    } else {
+      Serial.println(F(">> USE: SIM DOOR <OPEN|CLOSE> | SIM ITEM <1|2|3> <1|0> | SIM OFF"));
     }
   }
   else if (strcmp_P(cmd, PSTR("BT")) == 0 || strcmp_P(cmd, PSTR("MODE")) == 0) {
