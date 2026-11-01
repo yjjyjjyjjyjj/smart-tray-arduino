@@ -26,7 +26,7 @@ const byte HX_DT[NUM_TRAYS]    = {2, 4};       // CH1: D2, CH2: D4
 const byte HX_CLOCK[NUM_TRAYS] = {3, 5};       // CH1: D3, CH2: D5
 
 const byte NUM_SPACES = 3;                     // 1번 트레이, 2번 트레이, 3번 우산 공간
-const byte STRIP_PIN[NUM_SPACES] = {8, 9, 10}; // D8: 1번칸, D9: 2번칸, D10: 3번(우산)칸
+const byte STRIP_PIN[NUM_SPACES] = {10, 9, 8}; // D10: 1번칸(트레이1), D9: 2번칸(트레이2), D8: 3번(우산)칸
 const byte LEDS_PER_STRIP = 8;                 // 스트립당 WS2812B 8구
 
 const byte FAN_PIN   = 11;                     // 우산 건조 팬 제어 핀 (D11)
@@ -39,6 +39,7 @@ const byte DOOR_CLOSED_LEVEL = LOW;            // 자석 부착(닫힘) = LOW, �
 const byte IR_DETECTED_LEVEL = LOW;            // 장애물 감지 = LOW
 
 const unsigned long DEBOUNCE_MS        = 40UL;
+const unsigned long LOADCELL_STABLE_MS = 450UL;   // 로드셀 거치/수거 판정 안정화 대기 시간 (450ms)
 const unsigned long STATE_HEARTBEAT_MS = 1000UL;  // 1초 주기 상태 스냅샷 전송
 const unsigned long NORMAL_BLINK_MS    = 750UL;   // 일반 백색 LED 0.75초 점멸 주기
 const unsigned long NORMAL_MAX_MS      = 60000UL; // 문 열림 일반 점등 최대 유지 시간 (60초)
@@ -49,7 +50,7 @@ SoftwareSerial bluetooth(BT_RX_PIN, BT_TX_PIN);
 // ==============================================================================
 // 2. EEPROM 저장용 설정 및 보정 데이터 구조체 (고정소수점 최적화)
 // ==============================================================================
-const uint16_t EEPROM_MAGIC = 0xA412;
+const uint16_t EEPROM_MAGIC = 0xA416;
 
 // 공간별 설정 비트 플래그
 const uint8_t CFG_LED_EN        = 0x01;
@@ -63,9 +64,9 @@ struct PersistentData {
   uint16_t bootCount;
   long tareOffset[NUM_TRAYS];       // 로드셀 영점 Raw 기준값
   long scaleX10[NUM_TRAYS];         // (1g당 Raw 변화량) * 10 (예: 25.0 -> 250)
-  int16_t detectDg[NUM_TRAYS];      // 감지 문턱값 (0.1g 단위, 기본 150 = 15.0g)
-  int16_t releaseDg[NUM_TRAYS];     // 해제 문턱값 (0.1g 단위, 기본 80  = 8.0g)
-  int16_t deadzoneDg[NUM_TRAYS];    // 데드존 (0.1g 단위, 기본 30 = 3.0g)
+  int16_t detectDg[NUM_TRAYS];      // 감지 문턱값 (0.1g 단위, 기본 400 = 40.0g)
+  int16_t releaseDg[NUM_TRAYS];     // 해제 문턱값 (0.1g 단위, 기본 200 = 20.0g)
+  int16_t deadzoneDg[NUM_TRAYS];    // 데드존 (0.1g 단위, 기본 120 = 12.0g)
   uint8_t tareValidMask;            // bit0: CH1, bit1: CH2
   uint8_t spaceFlags[NUM_SPACES];   // CFG_* 비트마스크
   uint8_t sterilSec[NUM_SPACES];    // 살균 시간 (5, 10, 20, 30초)
@@ -209,11 +210,11 @@ struct WeatherDisplayState {
 
 WeatherDisplayState weatherLcd;
 
-// 수신 버퍼 및 통신 모드 (기본: MODE_BT 블루투스 모드, 시리얼 입력 시 MODE_SERIAL 독점 모드 전환)
+// 수신 버퍼 및 통신 모드 (기본: MODE_BT 블루투스 모드, 시리얼 명령 실행 시 MODE_SERIAL 전환)
 enum CommMode : uint8_t { MODE_BT = 0, MODE_SERIAL = 1 };
 CommMode commMode = MODE_BT;
-bool btPeerActive = false;                  // 블루투스로부터 데이터가 1회 이상 수신되었는지 여부
-const unsigned long SERIAL_MODE_TIMEOUT_MS = 180000UL; // 시리얼 무입력 180초 경과 시 자동 BT 모드 복귀
+bool btPeerActive = true;                   // 기본 BT 모드에서 1초 주기 상태 브로드캐스트 상시 활성
+const unsigned long SERIAL_MODE_TIMEOUT_MS = 30000UL; // 시리얼 무입력 30초 경과 시 자동 BT 모드 복귀
 
 char btRxBuf[168];
 byte btRxLen = 0;
@@ -496,17 +497,17 @@ void resetDefaultConfig() {
   for (byte i = 0; i < NUM_TRAYS; ++i) {
     config.tareOffset[i] = 0;
     config.scaleX10[i]   = 250; // 25.0 raw/g
-    config.detectDg[i]   = 150; // 15.0g
-    config.releaseDg[i]  = 80;  // 8.0g
-    config.deadzoneDg[i] = 30;  // 3.0g
+    config.detectDg[i]   = 400; // 40.0g (진동/미세 접촉 오감지 방지를 위해 보정값 상향)
+    config.releaseDg[i]  = 200; // 20.0g (히스테리시스 구간 확대)
+    config.deadzoneDg[i] = 120; // 12.0g (미세 드리프트/진동 무시 데드존 상향)
   }
   config.tareValidMask = 0;
 
   for (byte s = 0; s < NUM_SPACES; ++s) {
-    config.spaceFlags[s] = CFG_LED_EN | CFG_LED_DOOR;
+    config.spaceFlags[s] = CFG_LED_EN | CFG_LED_DOOR | CFG_STERIL_EN | CFG_STERIL_DETECT;
     config.sterilSec[s]  = 10;
   }
-  config.fanDurationSec = 0;
+  config.fanDurationSec = 30;
   saveConfigToEeprom();
 }
 
@@ -609,11 +610,16 @@ void startSterilization(byte spaceIdx, const char* reqId = NULL) {
   } else {
     outputs[spaceIdx].activeReqId[0] = '\0';
   }
+  ledsNeedHardwareRefresh = true;
   stateDirty = true;
 }
 
 void stopSterilization(byte spaceIdx, PGM_P reasonP = NULL, bool completed = false) {
-  if (spaceIdx >= NUM_SPACES || !outputs[spaceIdx].sterilActive) return;
+  if (spaceIdx >= NUM_SPACES) return;
+  if (!outputs[spaceIdx].sterilActive) {
+    stateDirty = true;
+    return;
+  }
 
   outputs[spaceIdx].sterilActive   = false;
   outputs[spaceIdx].sterilUntilMs  = 0;
@@ -622,6 +628,7 @@ void stopSterilization(byte spaceIdx, PGM_P reasonP = NULL, bool completed = fal
     sendAckP(outputs[spaceIdx].activeReqId, completed ? PSTR("completed") : PSTR("stopped"), reasonP);
   }
   outputs[spaceIdx].activeReqId[0] = '\0';
+  ledsNeedHardwareRefresh = true;
   stateDirty = true;
 }
 
@@ -636,12 +643,14 @@ void startFan(uint8_t seconds, const char* reqId = NULL) {
   } else {
     fan.activeReqId[0] = '\0';
   }
+  ledsNeedHardwareRefresh = true;
   stateDirty = true;
 }
 
 void stopFan(PGM_P reasonP = NULL, bool completed = false) {
   if (!fan.active) {
     digitalWrite(FAN_PIN, LOW);
+    stateDirty = true;
     return;
   }
   fan.active  = false;
@@ -651,6 +660,7 @@ void stopFan(PGM_P reasonP = NULL, bool completed = false) {
     sendAckP(fan.activeReqId, completed ? PSTR("completed") : PSTR("stopped"), reasonP);
   }
   fan.activeReqId[0] = '\0';
+  ledsNeedHardwareRefresh = true;
   stateDirty = true;
 }
 
@@ -687,6 +697,7 @@ void onSpaceItemChanged(byte spaceIdx, bool nowPresent) {
     if (outputs[spaceIdx].sterilActive) stopSterilization(spaceIdx, PSTR("item_removed"), false);
     if (spaceIdx == 2 && fan.active) stopFan(PSTR("item_removed"), false);
   }
+  ledsNeedHardwareRefresh = true;
   stateDirty = true;
 }
 
@@ -714,6 +725,7 @@ void onDoorStateChanged(bool nowOpen) {
       if (!outputs[s].manualOverride) outputs[s].normalActive = false;
     }
   }
+  ledsNeedHardwareRefresh = true;
   stateDirty = true;
 }
 
@@ -735,6 +747,9 @@ void evaluateOutputs() {
     blinkPhaseOn = !blinkPhaseOn;
   }
 
+  bool rxBusy = (Serial.available() > 0 || serialRxLen > 0 ||
+                 (commMode == MODE_BT && (bluetooth.available() > 0 || btRxLen > 0)));
+
   for (byte s = 0; s < NUM_SPACES; ++s) {
     uint8_t flags = config.spaceFlags[s];
 
@@ -751,11 +766,13 @@ void evaluateOutputs() {
       if ((int32_t)(now - outputs[s].normalUntilMs) >= 0) {
         outputs[s].normalActive   = false;
         outputs[s].manualOverride = false;
+        ledsNeedHardwareRefresh = true;
         stateDirty = true;
       } else if (!outputs[s].manualOverride) {
         if (!(flags & CFG_LED_EN) || !(flags & CFG_LED_DOOR) ||
             !door.active || !isSpaceItemPresent(s)) {
           outputs[s].normalActive = false;
+          ledsNeedHardwareRefresh = true;
           stateDirty = true;
         }
       }
@@ -766,8 +783,8 @@ void evaluateOutputs() {
     if (outputs[s].sterilActive) targetCode = 2;
     else if (outputs[s].normalActive && blinkPhaseOn) targetCode = 1;
 
-    // 시리얼 명령 수신 중에는 WS2812B cli() 호출을 잠시 보류하여 UART 오버런 방지
-    if (Serial.available() == 0 && serialRxLen == 0) {
+    // 시리얼/블루투스 명령 수신 중에는 WS2812B cli() 호출을 잠시 보류하여 UART 오버런 방지
+    if (!rxBusy) {
       if (ledsNeedHardwareRefresh || outputs[s].currentStateCode != targetCode) {
         outputs[s].currentStateCode = targetCode;
         if (targetCode == 2) writeStripHardware(s, 150, 0, 255);
@@ -776,7 +793,7 @@ void evaluateOutputs() {
       }
     }
   }
-  if (Serial.available() == 0 && serialRxLen == 0) {
+  if (!rxBusy) {
     ledsNeedHardwareRefresh = false;
   }
 }
@@ -785,8 +802,9 @@ void evaluateOutputs() {
 // 11. 센서 폴링 (현관문 A0, 우산 IR A3, 로드셀 CH1/CH2)
 // ==============================================================================
 void pollSensors() {
-  // 시리얼 데이터를 읽는 도중에는 센서 cli() 폴링을 건너뛰고 즉시 수신 우선 처리
+  // 시리얼/블루투스 데이터를 읽는 도중에는 센서 cli() 폴링을 건너뛰고 즉시 수신 우선 처리
   if (Serial.available() > 0 || serialRxLen > 0) return;
+  if (commMode == MODE_BT && (bluetooth.available() > 0 || btRxLen > 0)) return;
 
   unsigned long now = millis();
 
@@ -828,10 +846,10 @@ void pollSensors() {
   // 3) 로드셀 1·2번 칸 - 가상 시뮬레이션(bit0, bit1) 중이 아닐 때만 물리 폴링
   for (byte i = 0; i < NUM_TRAYS; ++i) {
     if (simMask & (1 << i)) continue;
-    if (Serial.available() > 0) return;
+    if (Serial.available() > 0 || (commMode == MODE_BT && bluetooth.available() > 0)) return;
     long raw;
     if (readHX711Raw(i, raw)) {
-      if (raw == 8388607L || raw == -8388608L) {
+      if (raw == 8388607L || raw == -8388608L || raw == 0L || raw == -1L) {
         if (trays[i].health != SENSOR_ERROR) {
           trays[i].health = SENSOR_ERROR;
           stateDirty = true;
@@ -845,17 +863,20 @@ void pollSensors() {
         config.tareValidMask |= (1 << i);
         trays[i].rawFiltered = raw;
       } else {
-        trays[i].rawFiltered = (trays[i].rawFiltered * 6L + raw * 4L) / 10L;
+        // 7:3 저역통과 필터로 미세 진동 및 노이즈 억제 강화
+        trays[i].rawFiltered = (trays[i].rawFiltered * 7L + raw * 3L) / 10L;
       }
 
       long deltaRaw = trays[i].rawFiltered - config.tareOffset[i];
-      long sc10 = (labs(config.scaleX10[i]) > 0) ? config.scaleX10[i] : 250L;
-      // weightDg (0.1g 단위) = (deltaRaw * 100) / scaleX10
-      long dg = (deltaRaw * 100L) / sc10;
+      long sc10 = labs(config.scaleX10[i]);
+      if (sc10 < 1) sc10 = 250L;
+      // 로드셀 장착 방향(+/-)에 관계없이 절대 변화량 기반으로 무게(0.1g 단위) 산출
+      long dg = (labs(deltaRaw) * 100L) / sc10;
 
-      if (!trays[i].present && labs(dg) < (config.deadzoneDg[i] * 8 / 10)) {
-        if (deltaRaw > 3) config.tareOffset[i]++;
-        else if (deltaRaw < -3) config.tareOffset[i]--;
+      // 빈 트레이 상태에서 데드존 이내의 느린 온도/영점 드리프트 자동 보정
+      if (!trays[i].present && dg < config.deadzoneDg[i]) {
+        if (deltaRaw > 4) config.tareOffset[i] += 2;
+        else if (deltaRaw < -4) config.tareOffset[i] -= 2;
       }
 
       if (dg < config.deadzoneDg[i]) dg = 0;
@@ -878,7 +899,7 @@ void pollSensors() {
       if (nextPresent != trays[i].candidatePresent) {
         trays[i].candidatePresent = nextPresent;
         trays[i].candidateSinceMs = now;
-      } else if (trays[i].present != nextPresent && (now - trays[i].candidateSinceMs >= 250UL)) {
+      } else if (trays[i].present != nextPresent && (now - trays[i].candidateSinceMs >= LOADCELL_STABLE_MS)) {
         trays[i].present = nextPresent;
         onSpaceItemChanged(i, nextPresent);
       }
@@ -945,9 +966,6 @@ void pumpSerialRx() {
         serialLineReady = true;
       }
     } else if (c >= 32 && c <= 126) {
-      if (commMode != MODE_SERIAL) {
-        setCommMode(MODE_SERIAL);
-      }
       if (serialRxLen + 1 < sizeof(serialRxBuf)) {
         serialRxBuf[serialRxLen++] = c;
       }
@@ -1096,6 +1114,7 @@ void handleJsonMessage(const char* line, Stream &replyStream) {
   char reqId[12] = {0};
   if (!extractJsonStringP(line, PSTR("type"), type, sizeof(type))) {
     sendAckP(NULL, PSTR("rejected"), PSTR("invalid_json"));
+    stateDirty = true;
     return;
   }
   if (!extractJsonStringP(line, PSTR("req"), reqId, sizeof(reqId))) {
@@ -1105,9 +1124,11 @@ void handleJsonMessage(const char* line, Stream &replyStream) {
   // 1) get_state
   if (strcmp_P(type, PSTR("get_state")) == 0) {
     if (reqId[0]) sendAckP(reqId, PSTR("accepted"));
-    sendStateSnapshot(replyStream);
-    lastStateSentMs = millis();
-    stateDirty = false;
+    if (&replyStream == (Stream*)&Serial) {
+      sendStateSnapshot(Serial);
+    } else {
+      stateDirty = true;
+    }
     return;
   }
 
@@ -1117,6 +1138,7 @@ void handleJsonMessage(const char* line, Stream &replyStream) {
     if (!extractJsonIntP(line, PSTR("space"), space)) extractJsonIntP(line, PSTR("space_id"), space);
     if (space < 1 || space > 3) {
       sendAckP(reqId, PSTR("rejected"), PSTR("invalid_space"));
+      stateDirty = true;
       return;
     }
     byte idx = (byte)(space - 1);
@@ -1149,11 +1171,21 @@ void handleJsonMessage(const char* line, Stream &replyStream) {
       }
     }
 
-    if (!(flags & CFG_STERIL_EN) && outputs[idx].sterilActive) stopSterilization(idx, PSTR("disabled"), false);
-    if (!(flags & CFG_LED_EN)) outputs[idx].normalActive = false;
+    if (!(flags & CFG_STERIL_EN) && outputs[idx].sterilActive) {
+      stopSterilization(idx, PSTR("disabled"), false);
+    }
+    if (!(flags & CFG_LED_EN) || !(flags & CFG_LED_DOOR)) {
+      if (!outputs[idx].manualOverride) outputs[idx].normalActive = false;
+    } else if (door.active && isSpaceItemPresent(idx) && !outputs[idx].normalActive) {
+      unsigned long now = millis();
+      outputs[idx].normalActive    = true;
+      outputs[idx].normalStartedMs = now;
+      outputs[idx].normalUntilMs   = now + NORMAL_MAX_MS;
+    }
 
     saveConfigToEeprom();
     sendAckP(reqId, PSTR("accepted"));
+    ledsNeedHardwareRefresh = true;
     stateDirty = true;
     return;
   }
@@ -1166,19 +1198,19 @@ void handleJsonMessage(const char* line, Stream &replyStream) {
     if (!extractJsonIntP(line, PSTR("space"), space)) extractJsonIntP(line, PSTR("space_id"), space);
 
     if (strcmp_P(action, PSTR("start_steril")) == 0 || strcmp_P(action, PSTR("start_sterilization")) == 0) {
-      if (space < 1 || space > 3) { sendAckP(reqId, PSTR("rejected"), PSTR("invalid_space")); return; }
+      if (space < 1 || space > 3) { sendAckP(reqId, PSTR("rejected"), PSTR("invalid_space")); stateDirty = true; return; }
       byte idx = (byte)(space - 1);
-      if (!(config.spaceFlags[idx] & CFG_STERIL_EN)) { sendAckP(reqId, PSTR("rejected"), PSTR("steril_disabled")); return; }
-      if (!isSpaceSensorOk(idx)) { sendAckP(reqId, PSTR("rejected"), PSTR("sensor_error")); return; }
-      if (!isSpaceItemPresent(idx)) { sendAckP(reqId, PSTR("rejected"), PSTR("no_item")); return; }
-      if (outputs[idx].sterilActive) { sendAckP(reqId, PSTR("rejected"), PSTR("already_running")); return; }
+      if (!(config.spaceFlags[idx] & CFG_STERIL_EN)) { sendAckP(reqId, PSTR("rejected"), PSTR("steril_disabled")); stateDirty = true; return; }
+      if (!isSpaceSensorOk(idx)) { sendAckP(reqId, PSTR("rejected"), PSTR("sensor_error")); stateDirty = true; return; }
+      if (!isSpaceItemPresent(idx)) { sendAckP(reqId, PSTR("rejected"), PSTR("no_item")); stateDirty = true; return; }
+      if (outputs[idx].sterilActive) { sendAckP(reqId, PSTR("rejected"), PSTR("already_running")); stateDirty = true; return; }
 
       sendAckP(reqId, PSTR("accepted"));
       startSterilization(idx, reqId);
       return;
     }
     if (strcmp_P(action, PSTR("stop_steril")) == 0 || strcmp_P(action, PSTR("stop_sterilization")) == 0) {
-      if (space < 1 || space > 3) { sendAckP(reqId, PSTR("rejected"), PSTR("invalid_space")); return; }
+      if (space < 1 || space > 3) { sendAckP(reqId, PSTR("rejected"), PSTR("invalid_space")); stateDirty = true; return; }
       sendAckP(reqId, PSTR("accepted"));
       stopSterilization((byte)(space - 1), PSTR("manual_stop"), false);
       return;
@@ -1187,8 +1219,8 @@ void handleJsonMessage(const char* line, Stream &replyStream) {
       long sec = config.fanDurationSec;
       extractJsonIntP(line, PSTR("sec"), sec);
       if (sec != 15 && sec != 30 && sec != 60) sec = (config.fanDurationSec > 0) ? config.fanDurationSec : 30;
-      if (!isSpaceSensorOk(2)) { sendAckP(reqId, PSTR("rejected"), PSTR("sensor_error")); return; }
-      if (!isSpaceItemPresent(2)) { sendAckP(reqId, PSTR("rejected"), PSTR("no_item")); return; }
+      if (!isSpaceSensorOk(2)) { sendAckP(reqId, PSTR("rejected"), PSTR("sensor_error")); stateDirty = true; return; }
+      if (!isSpaceItemPresent(2)) { sendAckP(reqId, PSTR("rejected"), PSTR("no_item")); stateDirty = true; return; }
 
       sendAckP(reqId, PSTR("accepted"));
       startFan((uint8_t)sec, reqId);
@@ -1200,16 +1232,17 @@ void handleJsonMessage(const char* line, Stream &replyStream) {
       return;
     }
     if (strcmp_P(action, PSTR("tare")) == 0) {
-      if (space < 1 || space > 2) { sendAckP(reqId, PSTR("rejected"), PSTR("invalid_space")); return; }
+      if (space < 1 || space > 2) { sendAckP(reqId, PSTR("rejected"), PSTR("invalid_space")); stateDirty = true; return; }
       if (performTare((byte)(space - 1), true)) {
         sendAckP(reqId, PSTR("accepted"));
-        stateDirty = true;
       } else {
         sendAckP(reqId, PSTR("rejected"), PSTR("sensor_error"));
       }
+      stateDirty = true;
       return;
     }
     sendAckP(reqId, PSTR("rejected"), PSTR("unknown_action"));
+    stateDirty = true;
     return;
   }
 
@@ -1222,6 +1255,7 @@ void handleJsonMessage(const char* line, Stream &replyStream) {
       setWeatherNoData();
       sendAckP(reqId, PSTR("accepted"));
       refreshLcdWeather(true);
+      stateDirty = true;
       return;
     }
 
@@ -1242,6 +1276,7 @@ void handleJsonMessage(const char* line, Stream &replyStream) {
       setWeatherNoData();
       sendAckP(reqId, PSTR("accepted"));
       refreshLcdWeather(true);
+      stateDirty = true;
       return;
     }
 
@@ -1262,10 +1297,12 @@ void handleJsonMessage(const char* line, Stream &replyStream) {
 
     sendAckP(reqId, PSTR("accepted"));
     refreshLcdWeather(true);
+    stateDirty = true;
     return;
   }
 
   sendAckP(reqId, PSTR("rejected"), PSTR("unknown_type"));
+  stateDirty = true;
 }
 
 // ==============================================================================
@@ -1323,18 +1360,24 @@ void printLiveMonitorLine() {
   Serial.println();
 }
 
-void handleSerialCommand(char* line) {
+void handleSerialCommand(char* line, bool fromSerial = true) {
   while (*line == ' ' || *line == '\t') ++line;
   if (*line == '\0') return;
 
   if (*line == '{') {
-    handleJsonMessage(line, Serial);
+    if (fromSerial && commMode != MODE_SERIAL) setCommMode(MODE_SERIAL);
+    handleJsonMessage(line, fromSerial ? (Stream&)Serial : (Stream&)bluetooth);
     return;
   }
 
   char* cmd = strtok(line, " \t");
   if (!cmd) return;
   toUpperStr(cmd);
+
+  if (fromSerial && commMode != MODE_SERIAL &&
+      strcmp_P(cmd, PSTR("EXIT")) != 0 && strcmp_P(cmd, PSTR("BTON")) != 0) {
+    setCommMode(MODE_SERIAL);
+  }
 
   if (strcmp_P(cmd, PSTR("HELP")) == 0 || strcmp_P(cmd, PSTR("H")) == 0 || strcmp_P(cmd, PSTR("?")) == 0) {
     printCalibrationHelp();
@@ -1401,7 +1444,7 @@ void handleSerialCommand(char* line) {
     if (!captureAverageRaw((byte)ch, avgRaw)) { Serial.println(F(">> SAMPLE ERR")); return; }
     long delta = avgRaw - config.tareOffset[ch];
     if (labs(delta) < 50) { Serial.println(F(">> DELTA TOO SMALL")); return; }
-    config.scaleX10[ch] = (delta * 100L) / knownDg;
+    config.scaleX10[ch] = (labs(delta) * 100L) / knownDg;
     Serial.print(F(">> CAL OK Sc=")); printDeci(Serial, config.scaleX10[ch]); Serial.println();
     stateDirty = true;
   }
@@ -1679,49 +1722,75 @@ void handleSerialCommand(char* line) {
 }
 
 // ==============================================================================
-// 14. 비차단 스트림 수신 루프
+// 14. 비차단 스트림 수신 루프 (블루투스 9600bps 원자적 프레임 수신 보장)
 // ==============================================================================
+void dispatchBluetoothLine(char* line) {
+  char* p = line;
+  while (*p == ' ' || *p == '\t') ++p;
+  if (*p == '\0') return;
+  // JSON 프레임('{', '}', ':' 포함)은 앱 프로토콜 파서로, 일반 텍스트는 수동 명령 파서로 전달
+  if (*p == '{' || strchr(p, ':') != NULL || strchr(p, '}') != NULL) {
+    handleJsonMessage(p, bluetooth);
+  } else {
+    handleSerialCommand(p, false);
+  }
+}
+
 void pollStreams() {
   unsigned long now = millis();
 
-  // 1) PC 시리얼(115200bps) 입력 최우선 확인 -> 입력 감지 시 자동으로 MODE_SERIAL 전환
+  // 1) PC 시리얼(115200bps) 입력 최우선 확인 -> 유효 명령 수신 시 MODE_SERIAL 전환
   pumpSerialRx();
   if (serialLineReady || (serialRxLen > 0 && (now - lastSerialRxMs > 120UL))) {
     serialRxBuf[serialRxLen] = '\0';
     serialRxLen = 0;
     serialLineReady = false;
-    handleSerialCommand(serialRxBuf);
+    handleSerialCommand(serialRxBuf, true);
     return;
   }
 
-  // 2) 시리얼 무입력 타임아웃(180초) 경과 시 기본 블루투스 모드(MODE_BT)로 자동 복귀
+  // 2) 시리얼 무입력 타임아웃(30초) 경과 시 기본 블루투스 모드(MODE_BT)로 자동 복귀
   if (commMode == MODE_SERIAL && !liveMonitorEnabled && serialRxLen == 0 &&
       (now - lastSerialRxMs >= SERIAL_MODE_TIMEOUT_MS)) {
     setCommMode(MODE_BT);
   }
 
-  // 3) 블루투스 모드(MODE_BT)일 때만 HC-06 수신 처리 (시리얼 모드에서는 완전 비활성화)
+  // 3) 블루투스 모드(MODE_BT)일 때 HC-06 수신 처리
+  //    데이터 수신이 시작되면 개행('\n') 도착 전까지 cli() 작업(HX711/WS2812B)으로 빠지지 않고
+  //    한 프레임을 끝까지 연속 수신하여 SoftwareSerial 비트 깨짐을 원천 차단
   if (commMode == MODE_BT) {
-    while (bluetooth.available()) {
-      char c = (char)bluetooth.read();
-      lastBtRxMs = now;
-      btPeerActive = true;
-      if (c == '\r') continue;
-      if (c == '\n') {
-        if (!btRxOverflow && btRxLen > 0) {
-          btRxBuf[btRxLen] = '\0';
-          handleJsonMessage(btRxBuf, bluetooth);
-        } else if (btRxOverflow) {
-          sendAckP(NULL, PSTR("rejected"), PSTR("frame_too_long"));
+    unsigned long burstStart = millis();
+    while (bluetooth.available() > 0 || (btRxLen > 0 && (millis() - lastBtRxMs < 25UL))) {
+      if (bluetooth.available() > 0) {
+        char c = (char)bluetooth.read();
+        lastBtRxMs = millis();
+        btPeerActive = true;
+        if (c == '\r') continue;
+        if (c == '\n') {
+          if (!btRxOverflow && btRxLen > 0) {
+            btRxBuf[btRxLen] = '\0';
+            dispatchBluetoothLine(btRxBuf);
+          } else if (btRxOverflow) {
+            sendAckP(NULL, PSTR("rejected"), PSTR("frame_too_long"));
+            stateDirty = true;
+          }
+          btRxLen = 0;
+          btRxOverflow = false;
+          break;
+        } else {
+          if (btRxLen + 1 < sizeof(btRxBuf)) btRxBuf[btRxLen++] = c;
+          else btRxOverflow = true;
         }
-        btRxLen = 0;
-        btRxOverflow = false;
-      } else {
-        if (btRxLen + 1 < sizeof(btRxBuf)) btRxBuf[btRxLen++] = c;
-        else btRxOverflow = true;
       }
+      if (millis() - burstStart > 400UL) break;
     }
-    if (btRxLen > 0 && (now - lastBtRxMs > 1500UL)) {
+
+    // 개행 문자가 유실되었더라도 마지막 바이트가 '}'이고 25ms 이상 추가 바이트가 없으면 복구 처리
+    if (btRxLen > 0 && (millis() - lastBtRxMs >= 25UL)) {
+      if (!btRxOverflow && btRxBuf[btRxLen - 1] == '}') {
+        btRxBuf[btRxLen] = '\0';
+        dispatchBluetoothLine(btRxBuf);
+      }
       btRxLen = 0;
       btRxOverflow = false;
     }
@@ -1734,6 +1803,7 @@ void pollStreams() {
 void setup() {
   Serial.begin(115200);
   commMode = MODE_BT;
+  btPeerActive = true;
   bluetooth.begin(9600);
 
   pinMode(FAN_PIN, OUTPUT);
@@ -1761,13 +1831,17 @@ void setup() {
   umbrella.active = (umbrella.stableLevel == IR_DETECTED_LEVEL);
   umbrella.health = SENSOR_OK;
 
+  // 부팅 시마다 현재 빈 트레이 상태를 기준으로 자동 영점(Tare) 재설정
+  config.tareValidMask = 0;
   for (byte i = 0; i < NUM_TRAYS; ++i) {
     pinMode(HX_DT[i], INPUT);
     pinMode(HX_CLOCK[i], OUTPUT);
     digitalWrite(HX_CLOCK[i], LOW);
     trays[i].health = SENSOR_WAITING;
     trays[i].lastSampleMs = now;
-    performTare(i, false, 250UL); // 부팅 시 빠른 초기 영점 확인 (최대 250ms)
+    if (!performTare(i, false, 600UL)) {
+      trays[i].health = SENSOR_WAITING;
+    }
   }
 
   Wire.begin();
@@ -1789,10 +1863,23 @@ void loop() {
   unsigned long now = millis();
   // 기본 블루투스 모드(MODE_BT)일 때만 블루투스로 상태 전송 (시리얼 모드에서는 BT 전송 안 함)
   if (commMode == MODE_BT) {
-    if (stateDirty || (btPeerActive && (now - lastStateSentMs >= STATE_HEARTBEAT_MS))) {
+    if (bluetooth.available() == 0 && btRxLen == 0 &&
+        (stateDirty || (btPeerActive && (now - lastStateSentMs >= STATE_HEARTBEAT_MS)))) {
+      // 변경된 출력(LED/팬) 상태를 하드웨어에 먼저 반영한 뒤 최신 상태 스냅샷 송신
+      evaluateOutputs();
       stateDirty = false;
-      lastStateSentMs = now;
+      lastStateSentMs = millis();
       sendStateSnapshot(bluetooth);
+
+      // 앱(FirmwareChannel)은 state 수신 직후(15~75ms 내) 대기 중인 요청(set_config/cmd/weather)을
+      // 즉시 송신하므로, 다음 루프의 cli() 작업(HX711/WS2812B) 진입 전에 최대 85ms 동안 수신 감시
+      unsigned long guardStart = millis();
+      while (millis() - guardStart < 85UL) {
+        if (bluetooth.available() > 0 || Serial.available() > 0) {
+          pollStreams();
+          break;
+        }
+      }
     }
   } else {
     // 시리얼 모드에서는 자동 BT 송신을 하지 않음
