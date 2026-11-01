@@ -1,5 +1,13 @@
 # 아마따 (AMATTA) · Smart Tray Arduino Firmware
 
+> **v1.2.5 FAST-RELEASE:** LED 드라이버 레지스터 충돌을 수정하고,
+> 수거 확인을 영점 보정과 분리해 통신 지연이 없을 때 약 0.3~0.4초에 소등합니다.
+> 부팅 자동 영점을 제거하고 수거 변화량 + 안정화 기반
+> 영점 보정을 적용했습니다. v1.1 이하의 보정에서 업데이트하면 최초 1회 `TARE` →
+> 각 채널 `CAL` → `SAVE`가 필요합니다. 아래의 기존 무게/즉시 수거 설명보다
+> [새 보정 절차와 판정 규칙](CALIBRATION.md)을 우선 적용하세요.
+> `main_edit.c/PresenceTracker.h`를 `.ino`와 함께 사용해야 합니다.
+
 **아마따(AMATTA)**는 현관의 소지품 트레이 2칸과 접이식 우산 보관 공간 1칸을 Android 앱([`smart-tray-app`](https://github.com/yjjyjjyjjyjj/smart-tray-app))과 Bluetooth Classic(HC-06)으로 연동하여, 외출할 때 소지품이나 우산을 두고 나가지 않도록 돕는 스마트 보관함의 **Arduino UNO R3 펌웨어 저장소**입니다.
 
 ---

@@ -1,6 +1,6 @@
 /*
  * ==============================================================================
- * 프로젝트: 아마따 (AMATTA) - 스마트 트레이 Arduino UNO R3 메인 펌웨어 (v1.1)
+ * 프로젝트: 아마따 (AMATTA) - 스마트 트레이 Arduino UNO R3 메인 펌웨어 (v1.2.5)
  * ==============================================================================
  * [메모리 최적화]
  * - Flash(프로그램 저장 공간) & SRAM(동적 메모리) 대폭 다이어트 적용
@@ -17,6 +17,7 @@
 #include <avr/interrupt.h>
 #include <stdlib.h>
 #include <string.h>
+#include "PresenceTracker.h"
 
 // ==============================================================================
 // 1. 핀 매핑 및 하드웨어 상수 정의
@@ -39,8 +40,7 @@ const byte DOOR_CLOSED_LEVEL = LOW;            // 자석 부착(닫힘) = LOW, �
 const byte IR_DETECTED_LEVEL = LOW;            // 장애물 감지 = LOW
 
 const unsigned long DEBOUNCE_MS         = 40UL;
-const unsigned long LOADCELL_DETECT_MS  = 450UL;  // 로드셀 물건 거치 판정 안정화 대기 시간 (450ms)
-const unsigned long LOADCELL_RELEASE_MS = 60UL;   // 로드셀 물건 수거(제거) 판정 즉시 반응 시간 (60ms)
+// Load-cell timing and stable removal are handled by PresenceTracker.h.
 const unsigned long STATE_HEARTBEAT_MS  = 1000UL; // 1초 주기 상태 스냅샷 전송
 const unsigned long NORMAL_BLINK_MS     = 750UL;  // 일반 백색 LED 0.75초 점멸 주기
 const unsigned long NORMAL_MAX_MS       = 60000UL;// 문 열림 일반 점등 최대 유지 시간 (60초)
@@ -69,7 +69,7 @@ struct PersistentData {
   int16_t detectDg[NUM_TRAYS];      // 감지 문턱값 (0.1g 단위, 기본 400 = 40.0g)
   int16_t releaseDg[NUM_TRAYS];     // 해제 문턱값 (0.1g 단위, 기본 200 = 20.0g)
   int16_t deadzoneDg[NUM_TRAYS];    // 데드존 (0.1g 단위, 기본 120 = 12.0g)
-  uint8_t tareValidMask;            // bit0: CH1, bit1: CH2
+  uint8_t tareValidMask;            // bit0/1: empty tare; bit4/5: signed calibration
   uint8_t spaceFlags[NUM_SPACES];   // CFG_* 비트마스크
   uint8_t sterilSec[NUM_SPACES];    // 살균 시간 (5, 10, 20, 30초)
   uint8_t fanDurationSec;           // 우산 건조 팬 시간 (0, 15, 30, 60초)
@@ -125,6 +125,7 @@ struct FanRuntime {
 };
 
 TrayRuntime trays[NUM_TRAYS];
+PresenceTracker presenceTrackers[NUM_TRAYS];
 DigitalSensorRuntime umbrella;
 DigitalSensorRuntime door;
 SpaceOutputRuntime outputs[NUM_SPACES];
@@ -327,13 +328,15 @@ void __attribute__((noinline)) ws2812Send(byte pin, const byte *data, uint16_t l
     "nop                       \n\t"
     "sbiw %[count],  1         \n\t"
     "brne head20_%=            \n\t"
-    : [port]  "+e" (port),
-      [byte]  "+r" (curbyte),
-      [bit]   "+d" (bit),
-      [next]  "+r" (next),
-      [count] "+w" (len),
-      [ptr]   "+e" (data)
-    : [hi]    "r" (hi),
+    // This multi-instruction loop modifies outputs before the final use of
+    // inputs. Early-clobber prevents next (initially lo) from aliasing lo.
+    : [byte]  "+&r" (curbyte),
+      [bit]   "+&d" (bit),
+      [next]  "+&r" (next),
+      [count] "+&w" (len),
+      [ptr]   "+&e" (data)
+    : [port]  "e" (port),
+      [hi]    "r" (hi),
       [lo]    "r" (lo)
     : "memory", "cc"
   );
@@ -554,9 +557,8 @@ void loadConfigFromEeprom() {
     resetDefaultConfig();
   } else {
     for (byte i = 0; i < NUM_TRAYS; ++i) {
-      if (config.detectDg[i] >= 350 && config.releaseDg[i] < 250) {
-        config.releaseDg[i] = 250;
-      }
+      if (!(config.tareValidMask & (1 << (i+4)))) config.tareValidMask &= ~(1 << i);
+      config.releaseDg[i] = PresenceTracker::validRelease(config.detectDg[i], config.releaseDg[i]);
     }
     config.bootCount++;
     saveConfigToEeprom();
@@ -586,47 +588,73 @@ bool readHX711Raw(byte ch, long &outRaw) {
   return true;
 }
 
-bool captureAverageRaw(byte ch, long &avgOut, unsigned long timeoutMs = 1500UL) {
-  long sum = 0;
-  byte count = 0;
+// Only fresh, stable samples can establish a zero or calibration reading.
+// No stale-filter fallback and no single-sample success.
+long lastCaptureSpan = 0;
+bool captureAverageRaw(byte ch, long &avgOut, unsigned long timeoutMs = 6000UL) {
+  StableSamples window = {};
+  uint16_t samples = 0, invalid = 0;
+  long minimum = 0, maximum = 0;
+  bool accepted = false;
+  long tolerance = PresenceTracker::calibrationTolerance(config.scaleX10[ch],
+      (config.tareValidMask & (1 << (ch+4))) != 0);
   unsigned long start = millis();
-  while (count < 6 && (millis() - start < timeoutMs)) {
-    long val;
-    if (readHX711Raw(ch, val)) {
-      if (val != 8388607L && val != -8388608L && val != 0L && val != -1L) {
-        sum += val;
-        count++;
-        delay(12);
-      }
+  unsigned long lastValid = start, maxGap = 0;
+  while (millis() - start < timeoutMs) {
+    long raw;
+    if (!readHX711Raw(ch, raw)) continue;
+    if (raw == 8388607L || raw == -8388608L || raw == 0L || raw == -1L) {
+      ++invalid;
+      window.clear();
+      continue;
+    }
+    unsigned long now = millis();
+    unsigned long gap = now - lastValid;
+    if (gap > maxGap) maxGap = gap;
+    lastValid = now;
+    if (!samples) minimum = maximum = raw;
+    if (raw < minimum) minimum = raw;
+    if (raw > maximum) maximum = raw;
+    ++samples;
+    if (window.add(raw, now, tolerance)) {
+      avgOut = window.mean;
+      lastCaptureSpan = window.high - window.low;
+      accepted = true;
+      break;
     }
   }
-  if (count > 0) {
-    avgOut = sum / (long)count;
-    return true;
-  }
-  // 실시간 루프에서 이미 정상 수신 중이었다면 직전 필터값 활용
-  if (trays[ch].health == SENSOR_OK && trays[ch].rawFiltered != 0) {
-    avgOut = trays[ch].rawFiltered;
-    return true;
-  }
-  return false;
+  unsigned long tailGap = millis() - lastValid;
+  if (tailGap > maxGap) maxGap = tailGap;
+  // USB diagnostics only: keep Bluetooth NDJSON free of debug text.
+  Serial.print(F("[ZERO-DIAG] CH:")); Serial.print(ch+1);
+  Serial.print(F(" OK:")); Serial.print(accepted);
+  Serial.print(F(" samples:")); Serial.print(samples);
+  Serial.print(F(" invalid:")); Serial.print(invalid);
+  Serial.print(F(" totalSpan:")); Serial.print(maximum-minimum);
+  Serial.print(F(" limit:")); Serial.print(tolerance);
+  Serial.print(F(" windowN:")); Serial.print(window.count);
+  Serial.print(F(" windowSpan:")); Serial.print(window.count ? window.high-window.low : 0);
+  Serial.print(F(" maxGapMs:")); Serial.println(maxGap);
+  return accepted;
 }
 
-bool performTare(byte ch, bool saveEeprom = false, unsigned long timeoutMs = 1500UL) {
+bool performTare(byte ch, bool saveEeprom = false, unsigned long timeoutMs = 6000UL) {
   if (ch >= NUM_TRAYS) return false;
   long avg;
   if (!captureAverageRaw(ch, avg, timeoutMs)) {
-    trays[ch].health = SENSOR_ERROR;
-    return false;
+    presenceTrackers[ch].interrupt();
+    return false; // Preserve the previous reference and presence on failure.
   }
   config.tareOffset[ch] = avg;
   config.tareValidMask |= (1 << ch);
+  presenceTrackers[ch].reset(avg);
   trays[ch].rawFiltered = avg;
-  trays[ch].weightDg    = 0;
-  trays[ch].present     = false;
-  trays[ch].candidatePresent = false;
-  trays[ch].health      = SENSOR_OK;
+  trays[ch].weightDg = 0;
+  bool wasPresent = trays[ch].present;
+  trays[ch].present = trays[ch].candidatePresent = false;
+  trays[ch].health = SENSOR_WAITING;
   trays[ch].lastSampleMs = millis();
+  if (wasPresent) onSpaceItemChanged(ch, false);
   if (saveEeprom) saveConfigToEeprom();
   return true;
 }
@@ -872,7 +900,8 @@ void evaluateOutputs() {
       }
     } else {
       // 자동 센서 연동 모드
-      if (!isSpaceItemPresent(s)) {
+      if ((s < NUM_TRAYS && !trays[s].present) ||
+          (s == 2 && !umbrella.active)) {
         outputs[s].itemPresentAtDoorOpen = false;
       }
       if (!door.active) {
@@ -1001,6 +1030,7 @@ void pollSensors() {
     long raw;
     if (readHX711Raw(i, raw)) {
       if (raw == 8388607L || raw == -8388608L || raw == 0L || raw == -1L) {
+        presenceTrackers[i].interrupt();
         if (trays[i].health != SENSOR_ERROR) {
           trays[i].health = SENSOR_ERROR;
           stateDirty = true;
@@ -1009,64 +1039,28 @@ void pollSensors() {
       }
 
       trays[i].lastSampleMs = now;
-      long sc10 = labs(config.scaleX10[i]);
-      if (sc10 < 1) sc10 = 250L;
-
-      if (!(config.tareValidMask & (1 << i))) {
-        config.tareOffset[i] = raw;
-        config.tareValidMask |= (1 << i);
-        trays[i].rawFiltered = raw;
-      } else {
-        // 물건이 올려져 있는 상태(present == true)에서 물건을 들어올려 순시 무게가 해제 문턱값 이하로 떨어지면
-        // 저역통과 필터 지연을 건너뛰고 즉시 Raw 값을 반영하여 백색 점멸/살균 LED가 지체 없이 꺼지도록 처리
-        long instDg = (labs(raw - config.tareOffset[i]) * 100L) / sc10;
-        if (trays[i].present && instDg <= config.releaseDg[i]) {
-          trays[i].rawFiltered = raw;
-        } else {
-          // 평상시에는 7:3 저역통과 필터로 미세 진동 및 노이즈 억제
-          trays[i].rawFiltered = (trays[i].rawFiltered * 7L + raw * 3L) / 10L;
-        }
+      trays[i].rawFiltered = raw; // Diagnostics: actual fresh ADC sample, before filtering.
+      // Low bits: explicit empty TARE. High bits: signed CAL/SCALE (legacy
+      // calibration discarded only for detection; EEPROM layout stays compatible).
+      uint8_t required = (1 << i) | (1 << (i + 4));
+      if ((config.tareValidMask & required) != required) {
+        trays[i].health = SENSOR_WAITING;
+        continue;
       }
-
-      long deltaRaw = trays[i].rawFiltered - config.tareOffset[i];
-      // 로드셀 장착 방향(+/-)에 관계없이 절대 변화량 기반으로 무게(0.1g 단위) 산출
-      long dg = (labs(deltaRaw) * 100L) / sc10;
-
-      // 빈 트레이 상태에서 데드존 이내의 느린 온도/영점 드리프트 자동 보정
-      if (!trays[i].present && dg < config.deadzoneDg[i]) {
-        if (deltaRaw > 4) config.tareOffset[i] += 2;
-        else if (deltaRaw < -4) config.tareOffset[i] -= 2;
-      }
-
-      if (dg < config.deadzoneDg[i]) dg = 0;
-      else if (dg > 30000L) dg = 30000L;
-
-      if (trays[i].present && labs(dg - trays[i].weightDg) >= 20) {
-        stateDirty = true;
-      }
-      trays[i].weightDg = (int16_t)dg;
-
-      if (trays[i].health != SENSOR_OK) {
-        trays[i].health = SENSOR_OK;
-        stateDirty = true;
-      }
-
-      bool nextPresent = trays[i].present;
-      if (dg >= config.detectDg[i]) nextPresent = true;
-      else if (dg <= config.releaseDg[i]) nextPresent = false;
-
-      // 물건을 올려놓을 때는 450ms 안정화(진동 무시), 물건을 뺄 때는 60ms 즉시 반응
-      unsigned long requiredStableMs = nextPresent ? LOADCELL_DETECT_MS : LOADCELL_RELEASE_MS;
-
-      if (nextPresent != trays[i].candidatePresent) {
-        trays[i].candidatePresent = nextPresent;
-        trays[i].candidateSinceMs = now;
-      } else if (trays[i].present != nextPresent && (now - trays[i].candidateSinceMs >= requiredStableMs)) {
-        trays[i].present = nextPresent;
-        onSpaceItemChanged(i, nextPresent);
-      }
+      bool changed = presenceTrackers[i].update(raw, now, config.tareOffset[i],
+          config.scaleX10[i], config.detectDg[i], config.releaseDg[i], config.deadzoneDg[i]);
+      if (!presenceTrackers[i].ready || presenceTrackers[i].sampleCount < 3) continue;
+      int16_t weight = presenceTrackers[i].weight;
+      if (weight < 0) weight = 0; // Signed values remain available in tracker diagnostics.
+      if (trays[i].present && abs(weight - trays[i].weightDg) >= 20) stateDirty = true;
+      trays[i].weightDg = weight;
+      if (trays[i].health != SENSOR_OK) { trays[i].health = SENSOR_OK; stateDirty = true; }
+      trays[i].present = presenceTrackers[i].present;
+      trays[i].candidatePresent = trays[i].present;
+      if (changed) onSpaceItemChanged(i, trays[i].present);
     } else {
       if (now - trays[i].lastSampleMs > HX_TIMEOUT_MS && trays[i].health != SENSOR_ERROR) {
+        presenceTrackers[i].interrupt();
         trays[i].health = SENSOR_ERROR;
         if (outputs[i].sterilActive) stopSterilization(i, PSTR("sensor_error"), false);
         outputs[i].normalActive = false;
@@ -1493,6 +1487,7 @@ void printCalibrationHelp() {
 }
 
 void printCalibrationStatus() {
+  Serial.println(F("AMATTA v1.2.5 FAST-RELEASE"));
   for (byte i = 0; i < NUM_TRAYS; ++i) {
     long delta = trays[i].rawFiltered - config.tareOffset[i];
     Serial.print(F("T#")); Serial.print(i + 1);
@@ -1502,6 +1497,9 @@ void printCalibrationStatus() {
     if (delta >= 0) Serial.print('+');
     Serial.print(delta);
     Serial.print(F(") Tare:")); Serial.print(config.tareOffset[i]);
+    Serial.print(F(" Zero:")); Serial.print(presenceTrackers[i].zero);
+    Serial.print(F(" Signed:")); printDeci(Serial, presenceTrackers[i].weight);
+    Serial.print(F(" Ready:")); Serial.print((config.tareValidMask & ((1 << i) | (1 << (i+4)))) == ((1 << i) | (1 << (i+4))));
     Serial.print(F(" Sc:")); printDeci(Serial, config.scaleX10[i]);
     Serial.print(F(" P:")); Serial.print(trays[i].present);
     Serial.print(F(" TH:")); printDeci(Serial, config.detectDg[i]);
@@ -1516,12 +1514,17 @@ void printLiveMonitorLine() {
   for (byte i = 0; i < NUM_TRAYS; ++i) {
     long delta = trays[i].rawFiltered - config.tareOffset[i];
     Serial.print(F(" | T")); Serial.print(i + 1); Serial.print(':');
-    printDeci(Serial, trays[i].weightDg);
-    Serial.print(F("g Raw:")); Serial.print(trays[i].rawFiltered);
+    uint8_t required = (1 << i) | (1 << (i+4));
+    if ((config.tareValidMask & required) != required) Serial.print(F("CAL_REQUIRED"));
+    else { printDeci(Serial, trays[i].weightDg); Serial.print('g'); }
+    Serial.print(F(" Raw:")); Serial.print(trays[i].rawFiltered);
     Serial.print('(');
     if (delta >= 0) Serial.print('+');
     Serial.print(delta);
     Serial.print(F(") P:")); Serial.print(trays[i].present);
+    Serial.print(F(" Signed:")); printDeci(Serial, presenceTrackers[i].weight);
+    Serial.print(F(" Zero:")); Serial.print(presenceTrackers[i].zero);
+    Serial.print(F(" Sensor:")); printHealthStr(Serial, trays[i].health);
   }
   Serial.print(F(" | U:")); Serial.print(umbrella.active);
   Serial.print(F(" F:")); Serial.print(fan.active);
@@ -1589,7 +1592,7 @@ void handleSerialCommand(char* line, bool fromSerial = true) {
         Serial.print(F(" OK Base=")); Serial.println(config.tareOffset[ch]);
       } else {
         Serial.print(F(">> TARE CH")); Serial.print(ch + 1);
-        Serial.print(F(" ERR: HX711 NO SIGNAL (DT=D")); Serial.print(HX_DT[ch]);
+        Serial.print(F(" ERR: UNSTABLE/TIMEOUT (DT=D")); Serial.print(HX_DT[ch]);
         Serial.print(F(" LVL=")); Serial.print(digitalRead(HX_DT[ch])); Serial.println(')');
       }
     }
@@ -1608,11 +1611,18 @@ void handleSerialCommand(char* line, bool fromSerial = true) {
       Serial.println(F(">> USE: CAL <1|2> <g>"));
       return;
     }
+    if (!(config.tareValidMask & (1 << ch))) { Serial.println(F(">> TARE FIRST (EMPTY TRAY)")); return; }
     long avgRaw;
-    if (!captureAverageRaw((byte)ch, avgRaw)) { Serial.println(F(">> SAMPLE ERR")); return; }
+    if (!captureAverageRaw((byte)ch, avgRaw)) { Serial.println(F(">> SAMPLE UNSTABLE/TIMEOUT")); return; }
     long delta = avgRaw - config.tareOffset[ch];
-    if (labs(delta) < 50) { Serial.println(F(">> DELTA TOO SMALL")); return; }
-    config.scaleX10[ch] = (labs(delta) * 100L) / knownDg;
+    if (labs(delta) < 50 || labs(delta) <= lastCaptureSpan * 10L) {
+      Serial.println(F(">> CAL: LOAD CHANGE TOO SMALL VS NOISE")); return;
+    }
+    long signedScale = (delta * 100L) / knownDg;
+    if (signedScale == 0) { Serial.println(F(">> SCALE TOO SMALL")); return; }
+    config.scaleX10[ch] = signedScale;
+    config.tareValidMask |= (1 << (ch + 4));
+    presenceTrackers[ch].reset(config.tareOffset[ch]);
     Serial.print(F(">> CAL OK Sc=")); printDeci(Serial, config.scaleX10[ch]); Serial.println();
     stateDirty = true;
   }
@@ -1623,6 +1633,8 @@ void handleSerialCommand(char* line, bool fromSerial = true) {
     long sc10 = parseDeci(a2);
     if (ch >= 0 && ch < NUM_TRAYS && labs(sc10) > 0) {
       config.scaleX10[ch] = sc10;
+      config.tareValidMask |= (1 << (ch + 4));
+      presenceTrackers[ch].reset(config.tareOffset[ch]);
       Serial.print(F(">> SCALE CH")); Serial.print(ch + 1);
       Serial.print('='); printDeci(Serial, sc10); Serial.println();
     } else {
@@ -1636,7 +1648,7 @@ void handleSerialCommand(char* line, bool fromSerial = true) {
     int ch = a1 ? (atoi(a1) - 1) : -1;
     long det = parseDeci(a2);
     long rel = parseDeci(a3);
-    if (ch >= 0 && ch < NUM_TRAYS && det >= 10) {
+    if (ch >= 0 && ch < NUM_TRAYS && det >= 10 && det <= 30000 && rel >= 0 && rel < det) {
       config.detectDg[ch]  = (int16_t)det;
       config.releaseDg[ch] = (int16_t)((rel > 0) ? rel : (det / 2));
       Serial.print(F(">> TH CH")); Serial.print(ch + 1);
@@ -2001,17 +2013,14 @@ void setup() {
   umbrella.active = (umbrella.stableLevel == IR_DETECTED_LEVEL);
   umbrella.health = SENSOR_OK;
 
-  // 부팅 시마다 현재 빈 트레이 상태를 기준으로 자동 영점(Tare) 재설정
-  config.tareValidMask = 0;
+  // Restore the explicit empty reference. Never tare a possibly loaded tray at boot.
   for (byte i = 0; i < NUM_TRAYS; ++i) {
     pinMode(HX_DT[i], INPUT);
     pinMode(HX_CLOCK[i], OUTPUT);
     digitalWrite(HX_CLOCK[i], LOW);
     trays[i].health = SENSOR_WAITING;
     trays[i].lastSampleMs = now;
-    if (!performTare(i, false, 600UL)) {
-      trays[i].health = SENSOR_WAITING;
-    }
+    presenceTrackers[i].reset(config.tareOffset[i]);
   }
 
   Wire.begin();
@@ -2020,7 +2029,9 @@ void setup() {
   initWeatherDisplayWait();
   refreshLcdWeather(true);
 
-  Serial.println(F("AMATTA READY [DEFAULT: BT MODE | Type any cmd for SERIAL MODE]"));
+  Serial.println(F("AMATTA v1.2.5 FAST-RELEASE [DEFAULT: BT MODE | Type any cmd for SERIAL MODE]"));
+  if ((config.tareValidMask & 0x33) != 0x33)
+    Serial.println(F("CAL REQUIRED: empty TARE, then CAL 1/2 <known grams>, SAVE"));
   stateDirty = true;
 }
 
