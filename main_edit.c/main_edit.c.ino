@@ -38,12 +38,14 @@ const byte IR_PIN    = A3;                     // 3번 공간 우산 감지 IR �
 const byte DOOR_CLOSED_LEVEL = LOW;            // 자석 부착(닫힘) = LOW, 분리(열림) = HIGH
 const byte IR_DETECTED_LEVEL = LOW;            // 장애물 감지 = LOW
 
-const unsigned long DEBOUNCE_MS        = 40UL;
-const unsigned long LOADCELL_STABLE_MS = 450UL;   // 로드셀 거치/수거 판정 안정화 대기 시간 (450ms)
-const unsigned long STATE_HEARTBEAT_MS = 1000UL;  // 1초 주기 상태 스냅샷 전송
-const unsigned long NORMAL_BLINK_MS    = 750UL;   // 일반 백색 LED 0.75초 점멸 주기
-const unsigned long NORMAL_MAX_MS      = 60000UL; // 문 열림 일반 점등 최대 유지 시간 (60초)
-const unsigned long HX_TIMEOUT_MS      = 1500UL;  // 로드셀 응답 타임아웃
+const unsigned long DEBOUNCE_MS         = 40UL;
+const unsigned long LOADCELL_DETECT_MS  = 450UL;  // 로드셀 물건 거치 판정 안정화 대기 시간 (450ms)
+const unsigned long LOADCELL_RELEASE_MS = 60UL;   // 로드셀 물건 수거(제거) 판정 즉시 반응 시간 (60ms)
+const unsigned long STATE_HEARTBEAT_MS  = 1000UL; // 1초 주기 상태 스냅샷 전송
+const unsigned long NORMAL_BLINK_MS     = 750UL;  // 일반 백색 LED 0.75초 점멸 주기
+const unsigned long NORMAL_MAX_MS       = 60000UL;// 문 열림 일반 점등 최대 유지 시간 (60초)
+const unsigned long HX_TIMEOUT_MS       = 1500UL; // 로드셀 응답 타임아웃
+const unsigned long LED_SELF_HEAL_MS    = 400UL;  // WS2812B 하드웨어 상태 주기적 재동기화 주기 (400ms)
 
 SoftwareSerial bluetooth(BT_RX_PIN, BT_TX_PIN);
 
@@ -131,6 +133,7 @@ FanRuntime fan;
 uint8_t simMask = 0;                // bit0~2: 1~3번칸 가상거치, bit3: 현관문 가상고정
 bool blinkPhaseOn = true;
 unsigned long lastBlinkToggleMs = 0;
+unsigned long lastLedSelfHealMs = 0;
 bool ledsNeedHardwareRefresh = true;
 bool liveMonitorEnabled = false;
 unsigned long lastMonitorPrintMs = 0;
@@ -276,58 +279,86 @@ void toUpperStr(char* s) {
 }
 
 // ==============================================================================
-// 6. 순수 AVR 고속 WS2812B 드라이버 (16MHz 정밀 타이밍)
+// 6. 순수 AVR 고속 WS2812B 드라이버 (16MHz 20클럭 800kHz 정밀 타이밍 & 300us 리셋 래치)
 // ==============================================================================
-void ws2812Send(byte pin, const byte *data, uint16_t len) {
+void __attribute__((noinline)) ws2812Send(byte pin, const byte *data, uint16_t len) {
   if (len == 0) return;
   volatile uint8_t *port = portOutputRegister(digitalPinToPort(pin));
   uint8_t pinMask = digitalPinToBitMask(pin);
-  uint8_t hi = *port | pinMask;
-  uint8_t lo = *port & ~pinMask;
+
+  // 직전 프레임(예: 백색 점멸 OFF 직후)과의 메타스테이블 리셋 충돌을 막기 위해
+  // 전송 시작 전 데이터 핀을 확실히 LOW로 내리고 300us 이상 리셋 구간 확보
+  digitalWrite(pin, LOW);
+  delayMicroseconds(300);
+
   uint8_t sreg = SREG;
   cli();
 
-  uint8_t curbyte, ctr;
+  uint8_t hi   = *port | pinMask;
+  uint8_t lo   = *port & ~pinMask;
+  uint8_t next = lo;
+  uint8_t bit  = 8;
+  uint8_t curbyte = *data++;
+
+  // 16MHz AVR 표준 20클럭(1.25us = 800kHz) 정밀 타이밍 루프
+  // - '0' 비트: T0H = 5클럭(312.5ns) / T0L = 15클럭(937.5ns)
+  // - '1' 비트: T1H = 12클럭(750.0ns) / T1L = 8클럭(500.0ns)
+  // - "memory" clobber 지정으로 컴파일러(-Os -flto)의 스택 버퍼 초기화 생략(Dead Store Elimination) 원천 방지
   asm volatile(
-    "1: \n\t"
-    "ld %[curbyte], %a[dataptr]+ \n\t"
-    "ldi %[ctr], 8 \n\t"
-    "2: \n\t"
-    "st %a[port], %[hi] \n\t"
-    "sbrs %[curbyte], 7 \n\t"
-    "st %a[port], %[lo] \n\t"
-    "lsl %[curbyte] \n\t"
-    "dec %[ctr] \n\t"
-    "rjmp .+0 \n\t"
-    "st %a[port], %[lo] \n\t"
-    "rjmp .+0 \n\t"
-    "brne 2b \n\t"
-    "sbiw %[count], 1 \n\t"
-    "brne 1b \n\t"
-    : [dataptr] "+e" (data),
+    "head20_%=:                \n\t"
+    "st   %a[port],  %[hi]     \n\t"
+    "sbrc %[byte],   7         \n\t"
+    "mov  %[next],   %[hi]     \n\t"
+    "dec  %[bit]               \n\t"
+    "st   %a[port],  %[next]   \n\t"
+    "mov  %[next],   %[lo]     \n\t"
+    "breq nextbyte20_%=        \n\t"
+    "rol  %[byte]              \n\t"
+    "rjmp .+0                  \n\t"
+    "st   %a[port],  %[lo]     \n\t"
+    "nop                       \n\t"
+    "rjmp .+0                  \n\t"
+    "nop                       \n\t"
+    "rjmp head20_%=            \n\t"
+    "nextbyte20_%=:            \n\t"
+    "ldi  %[bit],    8         \n\t"
+    "ld   %[byte],   %a[ptr]+  \n\t"
+    "st   %a[port],  %[lo]     \n\t"
+    "nop                       \n\t"
+    "sbiw %[count],  1         \n\t"
+    "brne head20_%=            \n\t"
+    : [port]  "+e" (port),
+      [byte]  "+r" (curbyte),
+      [bit]   "+d" (bit),
+      [next]  "+r" (next),
       [count] "+w" (len),
-      [curbyte] "=&d" (curbyte),
-      [ctr] "=&d" (ctr)
-    : [port] "e" (port),
-      [hi] "r" (hi),
-      [lo] "r" (lo)
+      [ptr]   "+e" (data)
+    : [hi]    "r" (hi),
+      [lo]    "r" (lo)
+    : "memory", "cc"
   );
 
+  *port = lo;
   SREG = sreg;
-  delayMicroseconds(80);
+  delayMicroseconds(300);
 }
 
-void writeStripHardware(byte spaceIdx, byte r, byte g, byte b) {
+void __attribute__((noinline)) writeStripHardware(byte spaceIdx, byte r, byte g, byte b, bool doubleLatch = false) {
   if (spaceIdx >= NUM_SPACES) return;
-  byte buf[LEDS_PER_STRIP * 3];
+  byte buf[LEDS_PER_STRIP * 3 + 1];
   for (byte i = 0; i < LEDS_PER_STRIP; ++i) {
     buf[i * 3 + 0] = g;
     buf[i * 3 + 1] = r;
     buf[i * 3 + 2] = b;
   }
-  ws2812Send(STRIP_PIN[spaceIdx], buf, sizeof(buf));
+  buf[LEDS_PER_STRIP * 3] = 0;
+  byte pin = STRIP_PIN[spaceIdx];
+  ws2812Send(pin, buf, LEDS_PER_STRIP * 3);
+  if (doubleLatch) {
+    ws2812Send(pin, buf, LEDS_PER_STRIP * 3);
+  }
   if (r == 0 && g == 0 && b == 0) {
-    digitalWrite(STRIP_PIN[spaceIdx], LOW);
+    digitalWrite(pin, LOW);
   }
 }
 
@@ -500,7 +531,7 @@ void resetDefaultConfig() {
     config.tareOffset[i] = 0;
     config.scaleX10[i]   = 250; // 25.0 raw/g
     config.detectDg[i]   = 400; // 40.0g (진동/미세 접촉 오감지 방지를 위해 보정값 상향)
-    config.releaseDg[i]  = 200; // 20.0g (히스테리시스 구간 확대)
+    config.releaseDg[i]  = 250; // 25.0g (물건 제거 시 잔류 탄성에도 즉시 해제되도록 설정)
     config.deadzoneDg[i] = 120; // 12.0g (미세 드리프트/진동 무시 데드존 상향)
   }
   config.tareValidMask = 0;
@@ -522,6 +553,11 @@ void loadConfigFromEeprom() {
   if (!ok) {
     resetDefaultConfig();
   } else {
+    for (byte i = 0; i < NUM_TRAYS; ++i) {
+      if (config.detectDg[i] >= 350 && config.releaseDg[i] < 250) {
+        config.releaseDg[i] = 250;
+      }
+    }
     config.bootCount++;
     saveConfigToEeprom();
   }
@@ -710,20 +746,29 @@ void onSpaceItemChanged(byte spaceIdx, bool nowPresent) {
     if (!door.active) {
       // 문이 닫혀 있을 때만 즉시 보라색 살균 LED 연속 점등 시작
       startSterilization(spaceIdx, NULL);
+      outputs[spaceIdx].currentStateCode = 2;
+      writeStripHardware(spaceIdx, 150, 0, 255, true);
     } else {
       // 문이 열려 있을 때 트레이에 물건이 들어가면 살균 LED는 작동하지 않음 (문이 닫힐 때 작동)
       if (outputs[spaceIdx].sterilActive) {
         stopSterilization(spaceIdx, PSTR("door_open"), false);
       }
+      outputs[spaceIdx].currentStateCode = 0;
+      writeStripHardware(spaceIdx, 0, 0, 0, true);
     }
     if (spaceIdx == 2 && config.fanDurationSec > 0) {
       startFan(config.fanDurationSec, NULL);
     }
   } else {
+    // 물건 제거 즉시 백색 점멸 및 살균 상태를 모두 해제하고 해당 트레이 물리 LED 신호를 즉시 종료(소등)
     outputs[spaceIdx].itemPresentAtDoorOpen = false;
-    outputs[spaceIdx].normalActive = false;
+    outputs[spaceIdx].normalActive    = false;
+    outputs[spaceIdx].normalStartedMs = 0;
+    outputs[spaceIdx].normalUntilMs   = 0;
     if (outputs[spaceIdx].sterilActive) stopSterilization(spaceIdx, PSTR("item_removed"), false);
     if (spaceIdx == 2 && fan.active) stopFan(PSTR("item_removed"), false);
+    outputs[spaceIdx].currentStateCode = 0;
+    writeStripHardware(spaceIdx, 0, 0, 0, true);
   }
   ledsNeedHardwareRefresh = true;
   stateDirty = true;
@@ -732,6 +777,8 @@ void onSpaceItemChanged(byte spaceIdx, bool nowPresent) {
 void onDoorStateChanged(bool nowOpen) {
   unsigned long now = millis();
   if (nowOpen) {
+    blinkPhaseOn = true;
+    lastBlinkToggleMs = now;
     for (byte s = 0; s < NUM_SPACES; ++s) {
       outputs[s].sterilPaused = false;
       outputs[s].itemPresentAtDoorOpen = isSpaceItemPresent(s);
@@ -741,30 +788,44 @@ void onDoorStateChanged(bool nowOpen) {
           stopSterilization(s, PSTR("door_open"), false);
         }
         if (shouldDoorBlinkSpace(s)) {
-          outputs[s].normalActive    = true;
-          outputs[s].normalStartedMs = now;
-          outputs[s].normalUntilMs   = now + NORMAL_MAX_MS;
+          outputs[s].normalActive     = true;
+          outputs[s].normalStartedMs  = now;
+          outputs[s].normalUntilMs    = now + NORMAL_MAX_MS;
+          outputs[s].currentStateCode = 1;
+          writeStripHardware(s, 120, 120, 120, true);
         } else {
-          outputs[s].normalActive = false;
+          outputs[s].normalActive     = false;
+          outputs[s].currentStateCode = 0;
+          writeStripHardware(s, 0, 0, 0, true);
         }
       }
     }
-    blinkPhaseOn = true;
-    lastBlinkToggleMs = now;
   } else {
-    // 문이 닫히면 일반 백색 점멸을 즉시 끄고, 물건/우산이 들어 있는 모든 칸에 살균 LED 연속 점등 적용
+    // 문이 닫히면(백색 점멸 ON/OFF 어느 타이밍이든) 일반 백색 점멸을 즉시 종료하고,
+    // 물건/우산이 들어 있는 모든 칸에 보라색 살균 LED를 2회 래치 전송으로 즉시 확정 적용
     for (byte s = 0; s < NUM_SPACES; ++s) {
       outputs[s].sterilPaused = false;
       outputs[s].itemPresentAtDoorOpen = false;
       if (!outputs[s].manualOverride) {
-        outputs[s].normalActive = false;
+        outputs[s].normalActive    = false;
+        outputs[s].normalStartedMs = 0;
+        outputs[s].normalUntilMs   = 0;
         if (isSpaceItemPresent(s)) {
           startSterilization(s, NULL);
+          outputs[s].currentStateCode = 2;
+          writeStripHardware(s, 150, 0, 255, true);
+        } else {
+          if (outputs[s].sterilActive) {
+            stopSterilization(s, PSTR("item_removed"), false);
+          }
+          outputs[s].currentStateCode = 0;
+          writeStripHardware(s, 0, 0, 0, true);
         }
       }
     }
   }
-  ledsNeedHardwareRefresh = true;
+  lastLedSelfHealMs = millis();
+  ledsNeedHardwareRefresh = false;
   stateDirty = true;
 }
 
@@ -789,6 +850,11 @@ void evaluateOutputs() {
   bool rxBusy = (Serial.available() > 0 || serialRxLen > 0 ||
                  (commMode == MODE_BT && (bluetooth.available() > 0 || btRxLen > 0)));
 
+  bool selfHealDue = (!rxBusy && (now - lastLedSelfHealMs >= LED_SELF_HEAL_MS));
+  if (selfHealDue) {
+    lastLedSelfHealMs = now;
+  }
+
   for (byte s = 0; s < NUM_SPACES; ++s) {
     uint8_t sec = config.sterilSec[s];
     if (sec != 5 && sec != 10 && sec != 20 && sec != 30) sec = 10;
@@ -806,6 +872,9 @@ void evaluateOutputs() {
       }
     } else {
       // 자동 센서 연동 모드
+      if (!isSpaceItemPresent(s)) {
+        outputs[s].itemPresentAtDoorOpen = false;
+      }
       if (!door.active) {
         // [문 닫힘 상태] 일반 백색 점멸은 끄고, 물건/우산이 거치되어 있으면 보라색 살균 LED 연속 유지
         if (outputs[s].normalActive) {
@@ -866,11 +935,12 @@ void evaluateOutputs() {
 
     // 시리얼/블루투스 명령 수신 중에는 WS2812B cli() 호출을 잠시 보류하여 UART 오버런 방지
     if (!rxBusy) {
-      if (ledsNeedHardwareRefresh || outputs[s].currentStateCode != targetCode) {
+      bool stateChanged = (outputs[s].currentStateCode != targetCode);
+      if (ledsNeedHardwareRefresh || stateChanged || (selfHealDue && targetCode != 0)) {
         outputs[s].currentStateCode = targetCode;
-        if (targetCode == 2) writeStripHardware(s, 150, 0, 255);
-        else if (targetCode == 1) writeStripHardware(s, 120, 120, 120);
-        else writeStripHardware(s, 0, 0, 0);
+        if (targetCode == 2) writeStripHardware(s, 150, 0, 255, stateChanged);
+        else if (targetCode == 1) writeStripHardware(s, 120, 120, 120, false);
+        else writeStripHardware(s, 0, 0, 0, stateChanged);
       }
     }
   }
@@ -939,18 +1009,26 @@ void pollSensors() {
       }
 
       trays[i].lastSampleMs = now;
+      long sc10 = labs(config.scaleX10[i]);
+      if (sc10 < 1) sc10 = 250L;
+
       if (!(config.tareValidMask & (1 << i))) {
         config.tareOffset[i] = raw;
         config.tareValidMask |= (1 << i);
         trays[i].rawFiltered = raw;
       } else {
-        // 7:3 저역통과 필터로 미세 진동 및 노이즈 억제 강화
-        trays[i].rawFiltered = (trays[i].rawFiltered * 7L + raw * 3L) / 10L;
+        // 물건이 올려져 있는 상태(present == true)에서 물건을 들어올려 순시 무게가 해제 문턱값 이하로 떨어지면
+        // 저역통과 필터 지연을 건너뛰고 즉시 Raw 값을 반영하여 백색 점멸/살균 LED가 지체 없이 꺼지도록 처리
+        long instDg = (labs(raw - config.tareOffset[i]) * 100L) / sc10;
+        if (trays[i].present && instDg <= config.releaseDg[i]) {
+          trays[i].rawFiltered = raw;
+        } else {
+          // 평상시에는 7:3 저역통과 필터로 미세 진동 및 노이즈 억제
+          trays[i].rawFiltered = (trays[i].rawFiltered * 7L + raw * 3L) / 10L;
+        }
       }
 
       long deltaRaw = trays[i].rawFiltered - config.tareOffset[i];
-      long sc10 = labs(config.scaleX10[i]);
-      if (sc10 < 1) sc10 = 250L;
       // 로드셀 장착 방향(+/-)에 관계없이 절대 변화량 기반으로 무게(0.1g 단위) 산출
       long dg = (labs(deltaRaw) * 100L) / sc10;
 
@@ -977,10 +1055,13 @@ void pollSensors() {
       if (dg >= config.detectDg[i]) nextPresent = true;
       else if (dg <= config.releaseDg[i]) nextPresent = false;
 
+      // 물건을 올려놓을 때는 450ms 안정화(진동 무시), 물건을 뺄 때는 60ms 즉시 반응
+      unsigned long requiredStableMs = nextPresent ? LOADCELL_DETECT_MS : LOADCELL_RELEASE_MS;
+
       if (nextPresent != trays[i].candidatePresent) {
         trays[i].candidatePresent = nextPresent;
         trays[i].candidateSinceMs = now;
-      } else if (trays[i].present != nextPresent && (now - trays[i].candidateSinceMs >= LOADCELL_STABLE_MS)) {
+      } else if (trays[i].present != nextPresent && (now - trays[i].candidateSinceMs >= requiredStableMs)) {
         trays[i].present = nextPresent;
         onSpaceItemChanged(i, nextPresent);
       }
